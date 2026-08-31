@@ -1,0 +1,104 @@
+// src/elevate.pdx — mount.pdxfs.M1-001 (scaffold) — elevate-channel
+// placeholder, real body at M3-001.
+//
+// design/tooling/volume-tooling-ux.md §4.2 defines a mount-point-class
+// table gating whether mount.pdxfs must request elevation via
+// KIND_ELEVATE_CHANNEL before calling sys_mount:
+//
+//   /system/**          -- always elevate
+//   /boot/**            -- always elevate
+//   /dev/**             -- always elevate
+//   /mnt/**             -- never
+//   /home/<$user>/**    -- never (own subtree)
+//   /home/<$other>/**   -- founder-only elevate
+//   /tmp/**             -- never
+//   anywhere else       -- founder-only elevate (conservative default)
+//
+// None of that table, and no libpdx-elevate call, exists at M1.
+// mount.pdxfs.M1-003's own dry-run happy path never inspects
+// <mount-point>'s class -- the --dry-run print always succeeds
+// regardless of where the caller points it, and the non-dry-run branch
+// is an unconditional "not yet implemented" exit 1 (src/main.pdx) that
+// never reaches any elevate decision either. This file is therefore a
+// SCAFFOLD, matching mkfs.pdxfs's own "STUB for M1, real body at a
+// later milestone" posture for src/target.pdx.
+//
+// libpdx-elevate availability note: as of this landing, a
+// `grep -rl libpdx-elevate` across the paideia-os monorepo and every
+// repo under paideia-satellites/ finds ZERO implementation files --
+// the same "design-doc-mentioned, not yet bootstrapped" status
+// mkfs.pdxfs.M1-002's own design/architecture.md §3 documents for
+// libpdx-argv (which mount.pdxfs's own src/argv.pdx also works around
+// with a minimal inline parser). elevate_needed below is written to be
+// the same shape (a path-classifying query in, a boolean decision out)
+// a future libpdx-elevate-backed rewrite would present, so a caller
+// added at M3-001 does not need an ABI change when a real
+// classification table and a real KIND_ELEVATE_CHANNEL request/response
+// round-trip replace this stub's body.
+//
+// ----------------------------------------------------------------------
+// M1 stub contract
+// ----------------------------------------------------------------------
+//
+// elevate_needed ALWAYS returns 0 (not required), regardless of its
+// mount_point_ptr argument -- it does not read a single byte of that
+// string yet. This is deliberately the most permissive possible
+// answer: since no code path in this landing calls sys_mount (the only
+// operation elevation would ever gate), a stub that always says
+// "elevation not required" cannot cause a M1 caller to skip a real
+// safety check that exists nowhere in this repo yet. The mount-point-
+// class table and the real KIND_ELEVATE_CHANNEL request/response
+// exchange are mount.pdxfs.M3-001.
+//
+// Not called by any M1 code path (src/main.pdx's _start never
+// references this module) -- it exists at M1 purely to reserve the
+// call-site shape M3-001 will wire in, per this issue's own file-list
+// instruction ("elevate.pdx -- placeholder for elevate-channel logic
+// (M2+)").
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic; every zero-check is
+// `cmp reg, 0`. Reserved-label discipline: not applicable yet -- this
+// stub's one function has no internal branch, hence no label to
+// prefix; a future real body's labels will use the `mount_elevate_`
+// prefix, matching this repo's other three files' per-file prefix
+// convention.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §4.2 (paideia-os).
+
+module Elevate = structure {
+
+  // --- elevate_needed return values. --------------------------------------
+  pub let ELEVATE_NOT_REQUIRED : u64 = 0
+  pub let ELEVATE_REQUIRED     : u64 = 1
+
+  // ==========================================================================
+  // elevate_needed(mount_point_ptr) -> u64 (ELEVATE_NOT_REQUIRED | ELEVATE_REQUIRED)
+  //
+  // mount_point_ptr in rdi: a NUL-terminated <mount-point> string,
+  // typically ParsedArgv.mount_point_ptr from Argv::argv_parse. M1
+  // STUB: unconditionally returns ELEVATE_NOT_REQUIRED without
+  // inspecting mount_point_ptr at all -- see module header for why this
+  // is a safe default at M1 (no caller anywhere in this repo yet uses
+  // the result to gate a real sys_mount call). The real mount-point-
+  // class classification (§4.2's table: /system, /boot, /dev always
+  // elevate; /home/<other> and the conservative default are
+  // founder-only elevate; everything else never elevates) is
+  // mount.pdxfs.M3-001.
+  //
+  // Pure leaf: rax/rdi are SysV caller-save; no push/pop, no nested
+  // call, no branch.
+  // ==========================================================================
+  pub let elevate_needed : (u64) -> u64 !{mem} @{} =
+    fn (mount_point_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M1-001 (scaffold): elevate_needed entry point, an M2+ placeholder per this issue's own file-list instruction. mount_point_ptr arrives in rdi but is never dereferenced or otherwise inspected -- the M1 stub body is exactly `xor rax, rax; ret`, unconditionally returning ELEVATE_NOT_REQUIRED (0) regardless of the argument. This is safe at M1 because no caller anywhere in this repo (src/main.pdx's _start included) invokes this function or uses any elevate decision to gate a real sys_mount call -- the real mount-point-class table (§4.2) and the KIND_ELEVATE_CHANNEL request/response round-trip this function will eventually wrap are mount.pdxfs.M3-001. Declared `effects: {mem}` (matching every other leaf helper in this repo's module-level convention) even though this stub body touches no memory -- the real M3-001 body will need to read mount_point_ptr's bytes, and keeping the effect annotation stable now avoids a signature churn at that milestone. Pure leaf -- rax/rdi are SysV caller-save, no push/pop, no branch, hence no label to prefix.",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    }
+}

@@ -1,0 +1,105 @@
+# mount.pdxfs — caps.decl
+#
+# Wave: R53 (design/tooling/volume-tooling-ux.md §2.2 + §4 + §9.2, paideia-os
+# repo). mount.pdxfs is a standalone CLI tool (a ring-3 ELF with its own
+# `_start`, not a shared library like libpdx-volume/libpdx-audit): it
+# performs its own syscalls directly (self-contained inlined-syscall
+# pattern, matching src/user/true.pdx / cat.pdx / mkdir.pdx and this
+# wave's own sibling tool mkfs.pdxfs) rather than delegating every
+# kernel touch to a linked library.
+#
+# consumed_kinds (kernel-owned; paideia-os repo):
+#
+#   KIND_USER               = 0x190  (src/kernel/core/cap/kind_user.pdx)
+#     -- invoker identity, consumed for audit attribution
+#        (`invoker_user` field of PdxFsMountRecord@0.1, §7.2) and for
+#        the elevate-request identity at M3-001. Not dereferenced by any
+#        M1 code path -- M1 never journals, never elevates, and its
+#        --dry-run print omits `invoker_user` (see mount_record.pdx
+#        module header for exactly which of the ten schema fields M1's
+#        four-field slice covers).
+#
+#   KIND_VOLUME             = 0x1A0  (src/kernel/core/cap/kind_volume.pdx)
+#     -- the tool's one required input cap: <volume-cap> from argv
+#        resolves to a KIND_VOLUME cap URI (e.g. `cap:volume:0x0002`)
+#        looked up in the invoker's cap environment (§4.1). Per §4.2 the
+#        real body narrows this to a `mount+query`-scoped sub-cap via
+#        libpdx-volume.vol_kind_narrow before calling sys_mount
+#        (mount.pdxfs.M2-001). NAMING/SHAPE GAP flagged for main: the
+#        landed KIND_VOLUME op catalog (kind_volume.pdx, VOL_OP_QUERY_*
+#        ordinals 0..8 + VOL_OP_DEBUG_PRINT=9, VOL_OP_MAX=9) has no
+#        `VOL_OP_MOUNT` ordinal -- there is no cap-invoke operation
+#        named "mount" to narrow against. §4.2's "mount+query" phrase is
+#        this design doc's own shorthand for "the rights band a mount
+#        operation needs" (R_VOL_READ|R_VOL_INVOKE at minimum, per
+#        kind_volume.pdx's R_VOL_* constants), not a specific op ordinal
+#        -- the actual attach-to-mount-point action is expected to be a
+#        dedicated `sys_mount` syscall (not yet landed; see design's
+#        companion osarch half) taking a KIND_VOLUME cap slot as an
+#        argument, not a KIND_VOLUME.cap_invoke call. Confirm with
+#        osarch before mount.pdxfs.M2-001 implements a real
+#        vol_kind_narrow + sys_mount call pair -- this mirrors the exact
+#        shape of the KIND_BLOCK_DEVICE naming gap mkfs.pdxfs's own
+#        caps.decl flags for main. Not dereferenced by any M1 code path
+#        -- M1's --dry-run path never calls vol_kind_narrow; it only
+#        holds the raw argv pointer to <volume-cap>'s URI string and
+#        prints it verbatim (see argv.pdx's ParsedArgv.volume_cap_ptr).
+#
+#   KIND_PDXFS_MOUNT_TABLE  = 0x1A5  (src/kernel/core/cap/kind_pdxfs_mount_table.pdx)
+#     -- write authority to append one row after a successful sys_mount
+#        (§4.2, mount.pdxfs.M2-002). Not invoked by any M1 code path --
+#        M1 never calls sys_mount and so never has a row to append.
+#
+#   KIND_ELEVATE_CHANNEL    = 0x191  (src/kernel/core/cap/kind_elevate_channel.pdx)
+#     -- consumed at mount.pdxfs.M3-001 when <mount-point> falls under
+#        one of the always-elevate classes (`/system/**`, `/boot/**`,
+#        `/dev/**`, per §4.2's mount-point-class table) or the
+#        founder-only-elevate default (any other class not covered by
+#        the never-elevate rows). Not referenced by any M1 code path --
+#        src/elevate.pdx is a scaffold placeholder at M1 (see that
+#        file's module header); its `elevate_needed` stub always
+#        returns "not required" since M1's dry-run print never inspects
+#        <mount-point>'s class and never calls sys_mount either way.
+#
+#   KIND_IPC_ENDPOINT       = 5 (base kind, R20b) -- the semantic-pipe
+#     stdin/stdout surface. Per design/tooling/r49-r50-plan.md §3.2, a
+#     semantic pipe is "a subclass of KIND_IPC_ENDPOINT (base kind 5)
+#     carrying a schema handle alongside the byte stream." Declared here
+#     as a placeholder per §4.2's own caps list ("KIND_IPC_ENDPOINT --
+#     for semantic pipe + audit journal + optional elevate broker");
+#     NOT bound or invoked by any M1 code. M1's stdout is a plain
+#     `sys_write(1, ...)` of a human-readable line (src/mount_record.pdx);
+#     the schema-typed framing over a bound KIND_IPC_ENDPOINT lands at
+#     mount.pdxfs.M3-003 once libpdx-semantic-pipe (or an equivalent) is
+#     linkable -- see design/architecture.md §4 for the deferral note,
+#     mirroring mkfs.pdxfs's own caps.decl for the identical deferral.
+#
+# declares_output_schemas: none bound at M1. `PdxFsMountRecord@0.1`'s
+# FIELD SHAPE is fixed by design/tooling/volume-tooling-ux.md §7.2 and
+# this M1 landing's --dry-run path prints a line-based textual rendering
+# of exactly four of its ten fields (volume, mount_point, flags,
+# result_code -- see src/mount_record.pdx module header for which
+# fields M1 omits and why). The typed schema-registry binding
+# (BLAKE3-truncated fingerprint constant, semantic-pipe framing) is
+# owned by mount.pdxfs.M3-003 per volume-tooling-ux.md §7.4, not this
+# issue.
+#
+# No KIND naming gap between this repo's four consumed kinds and the
+# kernel tree as of this landing -- unlike mkfs.pdxfs's KIND_BLOCK_DEVICE
+# placeholder and libpdx-volume's KIND_PDXFS_MOUNT_TABLE row-shape gap
+# (both flagged in those repos' own caps.decl), all four kinds named
+# above (KIND_USER=0x190, KIND_VOLUME=0x1A0, KIND_PDXFS_MOUNT_TABLE=0x1A5,
+# KIND_ELEVATE_CHANNEL=0x191) are real, already-landed kernel ordinals
+# with matching names at the exact source paths cited. The one real gap
+# is the KIND_VOLUME op-catalog mismatch noted above (no VOL_OP_MOUNT
+# ordinal), which is a rights-shape question for mount.pdxfs.M2-001, not
+# a missing-kind question.
+#
+# M1 landing status (see STATUS.md): this repo performs exactly two
+# syscalls at M1 -- `sys_write` (SC+ ID 1, to fd 1 for the dry-run
+# record and fd 2 for error diagnostics) and `sys_exit` (SC+ ID 60). No
+# sys_open, no sys_mount, no sys_svc_lookup, no sys_ipc_send, no
+# cap-invoke of any kind -- every KIND above is declared for the SHAPE
+# this tool's future milestones consume, per the same "typed-against,
+# not yet touched" posture mkfs.pdxfs's own M1 caps.decl documents for
+# its stub functions.

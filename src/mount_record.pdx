@@ -1,0 +1,272 @@
+// src/mount_record.pdx — mount.pdxfs.M1-001 (scaffold) + M1-003 (#3)
+// PdxFsMountRecord@0.1 emitter.
+//
+// design/tooling/volume-tooling-ux.md §7.2 defines the FULL
+// PdxFsMountRecord@0.1 schema: audit_id, mount_id, volume_uuid,
+// volume_cap_uri, mount_point, flags, invoker_user, result_code,
+// elevate_id, ts_ns -- ten fields, most of which require either (a) a
+// real sys_mount call to obtain mount_id / volume_uuid (mount.pdxfs.M2),
+// (b) libpdx-audit integration for audit_id (mount.pdxfs.M3-002), (c) a
+// KIND_USER lookup for invoker_user (mount.pdxfs.M3-*), (d) an elevate
+// round-trip for elevate_id (mount.pdxfs.M3-001), or (e) a real clock
+// read for ts_ns. None of that substrate exists at M1.
+//
+// What THIS file emits at M1 is the four-field slice this issue's own
+// task brief asks for -- a line-based, human-readable rendering on
+// stdout of exactly:
+//
+//   PdxFsMountRecord@0.1 { volume: <cap>, mount_point: <path>,
+//                          flags: <flags>, result_code: DRY_RUN }
+//
+// This is a REAL body, not a placeholder-value stub, for three of its
+// four fields: `volume` and `mount_point` are the caller's actual argv
+// strings, and `flags` is a real decimal conversion of the caller's
+// actual ParsedArgv.flags bitmask. Only `result_code` is a fixed
+// literal (`DRY_RUN`) -- matching mkfs.pdxfs's own format_record.pdx
+// precedent, where `dry_run: true` is likewise the one hardcoded field
+// in an otherwise-real four-field slice (this module's only caller,
+// main.pdx, reaches this function exclusively on the --dry-run branch,
+// so DRY_RUN is always correct at the one call site that exists at M1).
+//
+// What IS deferred to mount.pdxfs.M3-003 is (a) the remaining six
+// schema fields (audit_id, mount_id, volume_uuid, invoker_user,
+// elevate_id, ts_ns), none of which this file's single entry point
+// accepts or prints, and (b) the semantic-pipe framing itself -- a
+// schema-typed binary record over a bound KIND_IPC_ENDPOINT (per
+// design/tooling/r49-r50-plan.md §3.2), vs. this file's plain
+// `sys_write(1, ...)` of ASCII text.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. Every byte load uses the
+// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom. Byte STORES
+// (e.g. `mov al, 0x30; mov [rsp], al`) are unaffected by the paideia-as
+// #1248 load-side gap and use plain sub-register movs, matching
+// mkfs.pdxfs's own format_record.pdx (itself adapted from
+// src/user/init.pdx's print_u64_dec in the paideia-os monorepo). No
+// `test` mnemonic; every zero-check is `cmp reg, 0`. No `imul`/`mul`
+// (the decimal conversion only ever DIVIDES by the compile-time
+// constant 10 via `div`, unaffected by this codebase's imul-avoidance
+// convention, which is about MULTIPLYING by a compile-time constant).
+// Reserved-label discipline: every branch label in this file is
+// prefixed `mount_mr_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §7.2 (paideia-os);
+// mkfs.pdxfs's src/format_record.pdx (the sibling-repo precedent this
+// file's decimal-conversion loop and segment-by-segment sys_write
+// structure are adapted from).
+
+module MountRecord = structure {
+
+  // --- Literal chunks of the printed line (see module header for the
+  //     exact target shape). Lengths are exact byte counts, not
+  //     counting any trailing NUL the storage array happens to add. ----
+  pub let mr_lit_prefix     : [u8; 32] = "PdxFsMountRecord@0.1 { volume: \0"
+  pub let mr_lit_prefix_len : u64 = 31
+
+  pub let mr_lit_mount_point     : [u8; 16] = ", mount_point: \0"
+  pub let mr_lit_mount_point_len : u64 = 15
+
+  pub let mr_lit_flags     : [u8; 10] = ", flags: \0"
+  pub let mr_lit_flags_len : u64 = 9
+
+  pub let mr_lit_suffix     : [u8; 26] = ", result_code: DRY_RUN }\n\0"
+  pub let mr_lit_suffix_len : u64 = 25
+
+  // ==========================================================================
+  // mount_record_strlen(s) -> u64
+  //
+  // Byte-loop strlen, identical shape to mkfs.pdxfs's own
+  // format_record_strlen (and src/user/string.pdx's strlen in the
+  // paideia-os monorepo). Not shared with Argv (argv.pdx has no strlen
+  // of its own -- its parser only ever needs equality compares, never a
+  // length), so this file carries its own copy rather than introducing
+  // a link-order dependency on argv.pdx for one loop. Pure leaf:
+  // rax/rcx/rdi are SysV caller-save.
+  // ==========================================================================
+  pub let mount_record_strlen : (u64) -> u64 !{mem} @{} =
+    fn (s: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M1-001/M1-003: mount_record_strlen entry point. s in rdi. Loop: xor+mov_b loads *s into rcx (zero-extended); cmp rcx, 0; je mount_mr_strlen_done on NUL; else add rax,1 (counter) and add rdi,1 (cursor), loop. Pure leaf -- rax/rcx/rdi all SysV caller-save, no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed mount_mr_strlen_.",
+      block: {
+        xor rax, rax;
+
+      mount_mr_strlen_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0;
+        je mount_mr_strlen_done;
+        add rax, 1;
+        add rdi, 1;
+        jmp mount_mr_strlen_loop;
+
+      mount_mr_strlen_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mount_record_emit_dry_run(volume_cap_ptr, mount_point_ptr, flags) -> ()
+  //
+  //   rdi = volume_cap_ptr   (NUL-terminated <volume-cap> string, from
+  //                           ParsedArgv.volume_cap_ptr)
+  //   rsi = mount_point_ptr  (NUL-terminated <mount-point> string, from
+  //                           ParsedArgv.mount_point_ptr)
+  //   rdx = flags            (u64 bitmask; ParsedArgv.flags -- only the
+  //                           low 4 bits are ever set, per argv.pdx's
+  //                           PA_FLAG_* constants, but the full u64 is
+  //                           printed as a plain decimal number so a
+  //                           reader sees the exact bitmask value, e.g.
+  //                           `--ro --dry-run` prints `flags: 9`)
+  //
+  // Writes exactly one line to fd 1 (stdout) via a fixed sequence of
+  // sys_write calls, one per literal-or-dynamic segment -- matches
+  // mkfs.pdxfs's format_record_emit_dry_run's own splicing convention
+  // of several small sys_write calls in sequence rather than one
+  // buffer-assembly pass. Segments, in wire order:
+  //   1. mr_lit_prefix                "PdxFsMountRecord@0.1 { volume: "
+  //   2. volume_cap_ptr, length via mount_record_strlen
+  //   3. mr_lit_mount_point           ", mount_point: "
+  //   4. mount_point_ptr, length via mount_record_strlen
+  //   5. mr_lit_flags                 ", flags: "
+  //   6. flags, decimal-converted via an inline div-by-10 loop into a
+  //      24-byte stack scratch buffer (identical algorithm to
+  //      mkfs.pdxfs's format_record_emit_dry_run's own journal_size
+  //      conversion, itself adapted from src/user/init.pdx's
+  //      print_u64_dec in the paideia-os monorepo)
+  //   7. mr_lit_suffix                ", result_code: DRY_RUN }\n"
+  //
+  // Never returns an error code -- sys_write's return value is ignored
+  // on every call, matching mkfs.pdxfs's own posture at this maturity.
+  // Caller (main.pdx) calls sys_exit itself after this returns.
+  //
+  // Register plan. rbx/r12/r13 are SysV callee-save and are explicitly
+  // saved (push) on entry and restored (pop) before the single `ret` --
+  // this is a public entry point a future caller may rely on for
+  // register preservation, matching mkfs.pdxfs's own
+  // format_record_emit_dry_run discipline:
+  //   rbx = volume_cap_ptr   (held across segment 2's nested call)
+  //   r12 = mount_point_ptr  (held across segment 4's nested call)
+  //   r13 = flags            (held across segments 1-5, consumed at
+  //                           segment 6)
+  //
+  // No r14 is needed: mount_record_strlen touches only rax/rcx/rdi (its
+  // own justification), never rsi/rdx, so its return value in rax is
+  // moved directly into rdx for the very next sys_write.
+  // ==========================================================================
+  pub let mount_record_emit_dry_run : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (volume_cap_ptr: u64) (mount_point_ptr: u64) (flags: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mount.pdxfs.M1-003 (#3): mount_record_emit_dry_run entry point. SysV callee-save discipline: push rbx; push r12; push r13 (3 registers, 24 bytes) BEFORE repurposing any of them -- pops occur in reverse order immediately before the single `ret`. rbx=volume_cap_ptr, r12=mount_point_ptr, r13=flags, all now-saved SysV callee-save registers that survive the nested `call mount_record_strlen` invocations and the several `syscall` instructions below (mount_record_strlen clobbers only caller-save registers per its own justification; SYSCALL preserves callee-save registers by the amd64 fast-syscall convention, even with the kernel's #743 info-leak hardening zeroing rdi/rsi/rdx/r8/r9/r10 -- all caller-save -- before every sysret, which is exactly why this function reloads rdi/rsi/rdx fresh before every syscall rather than assuming any of them survive one). Segment 1: sys_write(1, mr_lit_prefix, 31) -- SC+ ID 1, rdi=fd, rsi=buf (rip-relative lea), rdx=count, rax=1, syscall. Segment 2: call mount_record_strlen(rbx) -> rax = len, moved directly into rdx; sys_write(1, rbx, rdx). Segment 3: sys_write(1, mr_lit_mount_point, 15). Segment 4: call mount_record_strlen(r12) -> rax -> rdx; sys_write(1, r12, rdx). Segment 5: sys_write(1, mr_lit_flags, 9). Segment 6: `sub rsp, 24` scratch (24 = 20 digit-buffer bytes + 4 alignment slop, matching mkfs.pdxfs's print_u64_dec-derived sizing) then a zero-value special case (r13 == 0 writes a single '0' byte) or the general div-by-10 loop: r9 = remaining value, r10 = cursor starting at rsp+19 and walking DOWN (writes digits most-significant-last, so the final [cursor, rsp+20) slice is already MSB-first with no separate reversal pass -- identical algorithm to mkfs.pdxfs's format_record_emit_dry_run's own journal_size conversion). `add rsp, 24` restores the stack after the digit sys_write. Segment 7: sys_write(1, mr_lit_suffix, 25). Pops r13/r12/rbx (reverse push order) and returns (no value; caller sys_exits itself). No `add reg,[mem]` (the digit-count computation `mov rax,rsp; add rax,20; sub rax,r10` operates on registers only, never adding a memory operand). No `test` mnemonic. No `imul`/`mul` -- only `div` by the compile-time constant 10. Labels prefixed mount_mr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                       // rbx = volume_cap_ptr
+        mov r12, rsi;                       // r12 = mount_point_ptr
+        mov r13, rdx;                       // r13 = flags
+
+        // ---- Segment 1: "PdxFsMountRecord@0.1 { volume: " ----------------
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_prefix];
+        mov rdx, 31;                        // mr_lit_prefix_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        // ---- Segment 2: volume-cap string ---------------------------------
+        mov rdi, rbx;
+        call mount_record_strlen;
+        mov rdx, rax;                       // rdx = volume_cap_len
+        mov rdi, 1;
+        mov rsi, rbx;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 3: ", mount_point: " ---------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_mount_point];
+        mov rdx, 15;                        // mr_lit_mount_point_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 4: mount-point string ---------------------------------
+        mov rdi, r12;
+        call mount_record_strlen;
+        mov rdx, rax;                       // rdx = mount_point_len
+        mov rdi, 1;
+        mov rsi, r12;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 5: ", flags: " ----------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_flags];
+        mov rdx, 9;                         // mr_lit_flags_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 6: flags, decimal --------------------------------------
+        sub rsp, 24;
+
+        cmp r13, 0;
+        jne mount_mr_flags_setup;
+
+        // Zero special case: single '0' digit.
+        mov al, 0x30;
+        mov [rsp], al;
+        mov rdi, 1;
+        mov rsi, rsp;
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        jmp mount_mr_flags_done;
+
+      mount_mr_flags_setup:
+        mov r9, r13;                        // r9 = remaining value
+        mov r10, rsp;
+        add r10, 19;                        // r10 = cursor at last staging byte
+
+      mount_mr_flags_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                       // zero-extend rdx:rax for div
+        div rcx;                            // rax = quotient, rdx = remainder
+        add rdx, 0x30;                      // digit -> ASCII '0'..'9'
+        mov [r10], dl;                      // store at cursor
+        mov r9, rax;                        // r9 = quotient
+        cmp r9, 0;
+        je mount_mr_flags_emit;
+        sub r10, 1;                         // advance cursor left (MSB-ward)
+        jmp mount_mr_flags_loop;
+
+      mount_mr_flags_emit:
+        // r10 points at the first (MSB) digit. Length = (rsp + 20) - r10.
+        mov rax, rsp;
+        add rax, 20;
+        sub rax, r10;                       // rax = digit count
+        mov rdx, rax;                       // sys_write count
+        mov rdi, 1;                         // fd
+        mov rsi, r10;                       // buf
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+      mount_mr_flags_done:
+        add rsp, 24;
+
+        // ---- Segment 7: ", result_code: DRY_RUN }\n" -------------------------
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_suffix];
+        mov rdx, 25;                        // mr_lit_suffix_len
+        mov rax, 1;
+        syscall;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

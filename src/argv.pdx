@@ -1,0 +1,294 @@
+// src/argv.pdx — mount.pdxfs.M1-002 (issue #2) — argv surface
+//
+// Long-flag CLI per design/tooling/volume-tooling-ux.md §4.1:
+//
+//   mount.pdxfs [--ro] [--noexec] [--verbose] [--dry-run] <volume-cap> <mount-point>
+//
+// libpdx-argv availability note: identical situation to mkfs.pdxfs's own
+// src/argv.pdx (see that repo's design/architecture.md §3 for the full
+// write-up) -- a `grep -rl libpdx-argv` across the paideia-os monorepo
+// and every repo under paideia-satellites/ still finds ZERO
+// implementation files as of this landing, only design-doc *mentions*
+// of a planned library. Per this issue's own instruction, this file
+// therefore implements a MINIMAL long-flag parser INLINE, in the exact
+// same shape mkfs.pdxfs.M1-002 landed: `argv_parse` takes
+// (argc, argv, out_ptr) and returns a u64 status code, so a future
+// libpdx-argv-backed rewrite can replace this function's body without
+// changing main.pdx's one call site.
+//
+// ----------------------------------------------------------------------
+// ParsedArgv -- out-struct layout (3 u64-aligned slots, 24 bytes)
+// ----------------------------------------------------------------------
+//
+// The task brief sketches this as a packed 20-byte struct (`flags` as
+// u32 + two u64 pointers). This file widens `flags` to a full u64 slot
+// instead, for the identical reason mkfs.pdxfs's own argv.pdx widens
+// its `flags` field: paideia-as has no native sub-8-byte struct-field
+// addressing beyond raw byte offsets, and a narrower flags slot saves
+// nothing in a struct that is otherwise all u64 -- every consumer
+// (main.pdx, mount_record.pdx) reads/writes PA_OFF_FLAGS as a plain
+// 8-byte `mov`. Only the LOW 4 BITS of the u64 are ever meaningful
+// (PA_FLAG_* below); bits 4..63 are always zero.
+//
+//   PA_OFF_FLAGS           = 0   -- bitmask, see PA_FLAG_* below
+//   PA_OFF_VOLUME_CAP_PTR  = 8   -- NUL-terminated <volume-cap> string
+//                                   ptr, or 0 if the caller supplied no
+//                                   first positional
+//   PA_OFF_MOUNT_POINT_PTR = 16  -- NUL-terminated <mount-point> string
+//                                   ptr, or 0 if the caller supplied no
+//                                   second positional
+//
+// PA_FLAG_RO / PA_FLAG_NOEXEC / PA_FLAG_VERBOSE / PA_FLAG_DRY_RUN are
+// boolean presence bits, bit0..bit3 respectively -- matches the task
+// brief's own bit assignment exactly.
+//
+// ----------------------------------------------------------------------
+// Parsing strategy
+// ----------------------------------------------------------------------
+//
+// One pass over argv[1..argc). Each token is tested against four known
+// flag literals via `argv_streq` (exact NUL-terminated equality -- all
+// four of this tool's flags are boolean, so unlike mkfs.pdxfs's argv.pdx
+// this file needs no `argv_prefix_match` / `argv_parse_u64_dec`
+// counterparts; there is no `--flag=value` surface at M1).
+//
+// A token matching none of the four flag literals is a positional.
+// Unlike mkfs.pdxfs (exactly one positional), this tool takes TWO:
+// the FIRST positional token encountered fills PA_OFF_VOLUME_CAP_PTR
+// (if not already filled), the SECOND fills PA_OFF_MOUNT_POINT_PTR (if
+// not already filled). A third or later positional is silently ignored
+// at M1 -- acceptable since a caller passing three positionals is
+// already misusing a two-positional CLI, and a stricter "extra
+// positional is an error" gate can be added later without an ABI
+// change (same posture mkfs.pdxfs's own argv.pdx documents for its
+// "duplicate positional" case).
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline (per project-wide non-negotiable)
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. Every byte load uses the
+// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom (paideia-as
+// #1248 workaround), matching cat.pdx / mkdir.pdx / touch.pdx and this
+// wave's own sibling tool mkfs.pdxfs. No `test` mnemonic; every
+// zero-check is `cmp reg, 0`. Reserved-label discipline: every branch
+// label in this file is prefixed `mount_argv_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §4.1 (paideia-os).
+
+module Argv = structure {
+
+  // --- ParsedArgv out-struct offsets (see module header). ---------------
+  pub let PA_OFF_FLAGS           : u64 = 0
+  pub let PA_OFF_VOLUME_CAP_PTR  : u64 = 8
+  pub let PA_OFF_MOUNT_POINT_PTR : u64 = 16
+  pub let PA_STRUCT_BYTES        : u64 = 24
+
+  // --- ParsedArgv.flags bit assignments (matches the task brief's own
+  //     bit0..bit3 layout exactly). -----------------------------------
+  pub let PA_FLAG_RO       : u64 = 0x1
+  pub let PA_FLAG_NOEXEC   : u64 = 0x2
+  pub let PA_FLAG_VERBOSE  : u64 = 0x4
+  pub let PA_FLAG_DRY_RUN  : u64 = 0x8
+
+  // --- argv_parse status codes. ------------------------------------------
+  pub let ARGV_OK                       : u64 = 0
+  pub let ARGV_ERR_MISSING_VOLUME_CAP   : u64 = 1
+  pub let ARGV_ERR_MISSING_MOUNT_POINT  : u64 = 2
+
+  // --- Flag literal storage (NUL-terminated exact-match literals). ------
+  pub let argv_lit_ro       : [u8; 5]  = "--ro\0"
+  pub let argv_lit_noexec   : [u8; 9]  = "--noexec\0"
+  pub let argv_lit_verbose  : [u8; 10] = "--verbose\0"
+  pub let argv_lit_dry_run  : [u8; 10] = "--dry-run\0"
+
+  // ==========================================================================
+  // argv_streq(a_ptr, b_ptr) -> u64 (1 = equal, 0 = not equal)
+  //
+  // Standard NUL-terminated exact-equality compare. Identical shape to
+  // mkfs.pdxfs's own Argv::argv_streq. Pure leaf: touches only
+  // rax/rcx/rdx/rdi/rsi (all SysV caller-save), no callee-save writes,
+  // no nested call.
+  // ==========================================================================
+  pub let argv_streq : (u64, u64) -> u64 !{mem} @{} =
+    fn (a_ptr: u64) (b_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M1-002 (#2): argv_streq entry point. Byte-loop equality compare, a_ptr in rdi, b_ptr in rsi. Each iteration: xor+mov_b loads a[i] into rcx and b[i] into rdx (zero-extended, per paideia-as #1248 workaround); cmp rcx, rdx; jne mount_argv_streq_no on mismatch; cmp rcx, 0; je mount_argv_streq_yes when both sides hit NUL simultaneously (rcx==rdx==0 at that point since the prior cmp did not diverge); otherwise advance both pointers and loop. Pure leaf -- rax/rcx/rdx/rdi/rsi are all SysV caller-save, no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed mount_argv_streq_.",
+      block: {
+      mount_argv_streq_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        xor rdx, rdx;
+        mov_b rdx, [rsi];
+        cmp rcx, rdx;
+        jne mount_argv_streq_no;
+        cmp rcx, 0;
+        je mount_argv_streq_yes;
+        add rdi, 1;
+        add rsi, 1;
+        jmp mount_argv_streq_loop;
+
+      mount_argv_streq_yes:
+        mov rax, 1;
+        ret;
+
+      mount_argv_streq_no:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // argv_parse(argc, argv, out_ptr) -> u64
+  //     (ARGV_OK | ARGV_ERR_MISSING_VOLUME_CAP | ARGV_ERR_MISSING_MOUNT_POINT)
+  //
+  //   rdi = argc   (per the frozen execve ABI, design/user/execve-abi.md
+  //                 in paideia-os -- argc arrives in rdi at _start and is
+  //                 forwarded here unchanged by main.pdx)
+  //   rsi = argv   (VA of a char*[]; argv[0] is the program name and is
+  //                 skipped -- this loop starts at index 1)
+  //   rdx = out_ptr (ParsedArgv struct; PA_STRUCT_BYTES = 24 bytes,
+  //                 caller-allocated .bss per main.pdx)
+  //
+  // Register plan across the loop (all SysV callee-save; pushed on entry
+  // and popped at the shared epilogue, so they survive the nested
+  // `call argv_streq` invocations):
+  //   rbx = argc
+  //   r12 = &argv[0]
+  //   r13 = out_ptr
+  //   r14 = i (loop index, starts at 1)
+  //   r15 = argv[i] (current token pointer, reloaded each iteration)
+  //
+  // Zero-init pass writes flags=0, volume_cap_ptr=0, mount_point_ptr=0
+  // into out_ptr BEFORE the scan loop -- every field defaults to
+  // "unset", unlike mkfs.pdxfs's argv_parse (which defaults
+  // journal_size to a non-zero constant); this tool has no numeric
+  // value-flag with a meaningful non-zero default at M1.
+  // ==========================================================================
+  pub let argv_parse : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (argc: u64) (argv: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M1-002 (#2) + M1-003 (#3): argv_parse entry point. SysV callee-save discipline: pushes rbx/r12/r13/r14/r15 (5 registers, 40 bytes) BEFORE repurposing any of them, and pops all five (in reverse order) at the single shared epilogue (mount_argv_epilogue) before every return -- this is a public entry point a future caller may rely on for register preservation, matching mkfs.pdxfs's own Argv::argv_parse discipline. Zero-init pass writes out.flags=0 (+0), out.volume_cap_ptr=0 (+8), out.mount_point_ptr=0 (+16) before scanning. Stashes argc/argv/out_ptr/loop-index/current-token into rbx/r12/r13/r14/r15 (all now-saved SysV callee-save regs) so they survive the nested `call argv_streq` invocations below (argv_streq clobbers only caller-save registers per its own justification). Main loop (mount_argv_scan_loop): cmp r14, rbx; jge mount_argv_scan_done once i==argc. r15 = [r12 + r14*8] (argv[i]). Four flag checks in a fixed order (--ro, --noexec, --verbose, --dry-run, each via argv_streq against its exact literal, each followed by an `or` into out.flags on a match) -- every check that DOESN'T match falls through to the next. A token matching none of the four is a positional: if out.volume_cap_ptr (reloaded from [r13+8]) == 0, it fills PA_OFF_VOLUME_CAP_PTR; else if out.mount_point_ptr (reloaded from [r13+16]) == 0, it fills PA_OFF_MOUNT_POINT_PTR; else (both already filled) it is silently ignored -- see module header for the two-positional fill-order rationale (mkfs.pdxfs's own argv.pdx has only one positional and so needs no analogous ordering gate). After a match (or the positional fallthrough), jmp mount_argv_scan_next which increments r14 and loops. After the loop: reload out.volume_cap_ptr; if == 0, jmp mount_argv_missing_volume_cap (rax=1, ARGV_ERR_MISSING_VOLUME_CAP); else reload out.mount_point_ptr; if == 0, jmp mount_argv_missing_mount_point (rax=2, ARGV_ERR_MISSING_MOUNT_POINT); else rax=0 (ARGV_OK). All three paths fall into the shared epilogue, which pops r15/r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` (every store is a plain `mov [r13+N], reg` or `mov [r13+N], rax`); no `test` mnemonic. Labels prefixed mount_argv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = argc
+        mov r12, rsi;                       // r12 = &argv[0]
+        mov r13, rdx;                       // r13 = out_ptr
+
+        // ---- Zero-init pass. ----------------------------------------------
+        xor rax, rax;
+        mov [r13 + 0], rax;                 // flags = 0
+        mov [r13 + 8], rax;                 // volume_cap_ptr = 0
+        mov [r13 + 16], rax;                // mount_point_ptr = 0
+
+        mov r14, 1;                         // i = 1 (skip argv[0])
+
+      mount_argv_scan_loop:
+        cmp r14, rbx;
+        jge mount_argv_scan_done;
+
+        mov r15, [r12 + r14*8];             // r15 = argv[i]
+
+        // ---- --ro (exact) --------------------------------------------------
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_ro];
+        call argv_streq;
+        cmp rax, 0;
+        je mount_argv_check_noexec;
+
+        mov rax, [r13 + 0];
+        or rax, 0x1;                        // PA_FLAG_RO
+        mov [r13 + 0], rax;
+        jmp mount_argv_scan_next;
+
+      mount_argv_check_noexec:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_noexec];
+        call argv_streq;
+        cmp rax, 0;
+        je mount_argv_check_verbose;
+
+        mov rax, [r13 + 0];
+        or rax, 0x2;                        // PA_FLAG_NOEXEC
+        mov [r13 + 0], rax;
+        jmp mount_argv_scan_next;
+
+      mount_argv_check_verbose:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_verbose];
+        call argv_streq;
+        cmp rax, 0;
+        je mount_argv_check_dry_run;
+
+        mov rax, [r13 + 0];
+        or rax, 0x4;                        // PA_FLAG_VERBOSE
+        mov [r13 + 0], rax;
+        jmp mount_argv_scan_next;
+
+      mount_argv_check_dry_run:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_dry_run];
+        call argv_streq;
+        cmp rax, 0;
+        je mount_argv_positional;
+
+        mov rax, [r13 + 0];
+        or rax, 0x8;                        // PA_FLAG_DRY_RUN
+        mov [r13 + 0], rax;
+        jmp mount_argv_scan_next;
+
+      mount_argv_positional:
+        // No flag matched -- this token is a positional. First fills
+        // volume_cap_ptr, second fills mount_point_ptr, third+ ignored.
+        mov rax, [r13 + 8];
+        cmp rax, 0;
+        jne mount_argv_positional_check_mount;
+
+        mov [r13 + 8], r15;                 // volume_cap_ptr = token
+        jmp mount_argv_scan_next;
+
+      mount_argv_positional_check_mount:
+        mov rax, [r13 + 16];
+        cmp rax, 0;
+        jne mount_argv_scan_next;           // already filled -- ignore
+
+        mov [r13 + 16], r15;                // mount_point_ptr = token
+
+      mount_argv_scan_next:
+        add r14, 1;
+        jmp mount_argv_scan_loop;
+
+      mount_argv_scan_done:
+        mov rax, [r13 + 8];                 // reload volume_cap_ptr
+        cmp rax, 0;
+        je mount_argv_missing_volume_cap;
+
+        mov rax, [r13 + 16];                // reload mount_point_ptr
+        cmp rax, 0;
+        je mount_argv_missing_mount_point;
+
+        xor rax, rax;                       // ARGV_OK
+        jmp mount_argv_epilogue;
+
+      mount_argv_missing_volume_cap:
+        mov rax, 1;                         // ARGV_ERR_MISSING_VOLUME_CAP
+        jmp mount_argv_epilogue;
+
+      mount_argv_missing_mount_point:
+        mov rax, 2;                         // ARGV_ERR_MISSING_MOUNT_POINT
+
+      mount_argv_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}
