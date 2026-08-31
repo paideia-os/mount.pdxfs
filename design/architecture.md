@@ -60,12 +60,20 @@ public-entry-point family" granularity):
   its own private `mount_record_strlen` helper. Directly analogous to
   `mkfs.pdxfs`'s `format_record.pdx`.
 - **`src/elevate.pdx`** (`Elevate`) — `elevate_needed`, an M1 scaffold
-  stub that unconditionally returns "not required" (see §5 below).
-  `mkfs.pdxfs` has no direct analogue to this file (its own elevate
-  concern is scoped to M3-005 with no M1 placeholder file) — this
-  repo's task brief explicitly asks for the placeholder to exist from
-  M1 so the M3-001 call site has somewhere to land without an ABI
-  change to `main.pdx`.
+  stub that unconditionally returned "not required" (see §5 below for
+  the original M1 posture; §10 for the real M2-003 classifier that
+  replaced it). `mkfs.pdxfs` has no direct analogue to this file (its
+  own elevate concern is scoped to M3-005 with no M1 placeholder file)
+  — this repo's task brief explicitly asked for the placeholder to
+  exist from M1 so the M3-001 call site has somewhere to land without
+  an ABI change to `main.pdx`.
+- **`src/volume_cap.pdx`** (`VolumeCap`) — new at M2-001. `volume_cap_
+  parse_slot` (a `cap:volume:0xNN` URI decoder) and `volume_cap_resolve`
+  (composes the parse with `libpdx-volume.vol_kind_narrow`). See §10.1.
+- **`src/mount_op.pdx`** (`MountOp`) — new at M2-002. `mount_op_invoke`
+  (the real-vs-dry-run `sys_mount` call) and `mount_op_append_row` (the
+  `KIND_PDXFS_MOUNT_TABLE` row-append stub). See §10.2 for the three
+  kernel-side gaps this file documents in full, with source citations.
 
 Kept as four separate files rather than one `main.pdx` monolith for the
 same reason `mkfs.pdxfs` gives: each has a distinct, independently
@@ -247,3 +255,137 @@ bug:
   before M3-001 opens whether it should also ship a minimal inline
   fallback (mirroring `mkfs.pdxfs`'s own open question for its
   M3-005).
+
+## 10. M2 landing — volume-cap resolve, sys_mount stub, elevate classifier
+
+M2 (issues #4, #5, #6) replaces M1's `--dry-run`-only / "not yet
+implemented" pair in `main.pdx` with the real pipeline: elevate-classify
+→ volume-cap resolve+narrow → `sys_mount` attempt (or dry-run skip) →
+one unified `PdxFsMountRecord@0.1` emit. Two new files
+(`src/volume_cap.pdx`, `src/mount_op.pdx`), one file rewritten in place
+(`src/elevate.pdx`, its M1 stub replaced with a real body — same public
+signature, so no other file needed an ABI change), one file extended
+(`src/mount_record.pdx`), and `main.pdx`'s `_start` rewritten to wire
+all four together.
+
+### 10.1 `volume_cap.pdx` — resolve + narrow, two open gaps
+
+`VolumeCap::volume_cap_parse_slot` decodes a `<volume-cap>` URI string
+(`cap:volume:0x0042`) into a raw cap-slot number via a hand-rolled
+byte-loop hex parser (prefix-match the literal `cap:volume:0x`, then
+accumulate hex digits via `shl 4; or`, never `imul`). `VolumeCap::
+volume_cap_resolve` composes that with libpdx-volume's `vol_kind_narrow`
+(`(cap_slot, requested_ops_mask, out_narrowed_cap_slot) -> u64`, a
+real M2-004 body per that repo's own `vol_kind.pdx` — a documented
+validate-and-passthrough, not a kernel-enforced derivation, since no
+`cap_narrow` primitive exists for `KIND_VOLUME` yet).
+
+Two gaps carried forward from M1, now concretely encountered rather
+than merely anticipated:
+
+- **No independent kind check.** This issue's brief asked for a
+  `cap_check_kind`-style validation that the slot is actually a
+  `KIND_VOLUME` before narrowing it. A monorepo-wide grep for
+  `cap_check_kind` / `cap_slot_kind` / any kind-query primitive finds
+  nothing — `cap_invoke`'s own per-kind dispatch decodes a slot's kind
+  internally but does not expose that decode as a standalone query.
+  `volume_cap_resolve` therefore performs no such check; it trusts the
+  caller-supplied slot number entirely.
+- **`ops_mask` has no real meaning yet.** Per this issue's own
+  instruction, `VC_OPS_MOUNT_QUERY = 0x3` (bits 0-1) stands in for
+  "VOL_MOUNT|VOL_QUERY" — but the landed `KIND_VOLUME` op catalog
+  (§6 above) has no `VOL_OP_MOUNT` ordinal, so bits 0-1 just happen to
+  land on `VOL_OP_QUERY_DEVICE_SLOT`/`VOL_OP_QUERY_MOUNT_SLOT`. The mask
+  passes `vol_kind_narrow`'s own gate (`VK_OPS_VALID_MASK = 0x3FF`) but
+  carries no enforced semantics beyond that.
+
+libpdx-volume's own README lists `mount.pdxfs` under "declared but not
+yet linked" for `vol_kind_mint`/`vol_kind_narrow`/`mount_table_snapshot`
+— `volume_cap.pdx` calls `vol_kind_narrow` by bare symbol,
+matching this repo's own intra-file call convention, but neither this
+repo's `tools/build.sh` (confirmed, by reading it, to compile each
+`src/*.pdx` file to its own standalone `.o` with no link step at all)
+nor any other script performs the actual cross-repo link. That edge is
+still open.
+
+### 10.2 `mount_op.pdx` — a documented stub, not a working syscall
+
+Per this issue's own instruction ("if [sys_mount] can already accept a
+KIND_VOLUME cap slot + mount-point path, wire against that; if not,
+STUB the invocation ... and flag the kernel gap"), `mount_op.pdx`'s own
+file header documents THREE independent kernel-side gaps found by
+reading the live kernel source, each with an exact citation:
+
+1. **`sys_mount` (sysno 75) is dispatch-unwired.** The live dispatch
+   table (`src/kernel/core/syscall/dispatch.pdx` L506-509) routes sysno
+   75 to a label `dispatch_mount` (L1975) that is STILL an
+   unconditional `mov rax, 0xFFFFFFFFFFFFFFDA (-ENOSYS); ret` — it reads
+   no argument register at all. This is despite `sys_mount_body` /
+   `sys_mount_shim` (`sys_mount.pdx`) already being a complete, real,
+   audit-emitting implementation; the dispatch-table wiring connecting
+   the two (the same shape `dispatch_open` / `dispatch_blkdev_cap_
+   request` already use for their own shims) was simply never landed.
+   A ring-3 caller cannot reach `sys_mount_body` through any syscall
+   today.
+2. **Two incompatible target ABIs for the same sysno.** `dispatch.pdx`'s
+   own forward-declaration comment (L1951-1962) documents an
+   ASPIRATIONAL cap-slot-based contract for sysno 75 (`a0=volume_cap_
+   slot, a1=mountpoint_path_va, a2=flags, a3=fstype`) — the shape
+   mount.pdxfs's own design targets. But `sys_mount_body`'s REAL,
+   already-landed signature (`dev_path_ptr, dev_path_len, mount_point_
+   ptr, mount_point_len, backend_id`) takes a raw device-path STRING,
+   not a cap slot, and has no code path that reads one. Confirming
+   which ABI sysno 75 should actually grow into is now the concrete,
+   sourced version of the "confirm with osarch" flag M1's own §6/§9
+   already raised.
+3. **`KIND_PDXFS_MOUNT_TABLE` has no working `APPEND_ROW`.**
+   `kind_pdxfs_mount_table.pdx`'s cap-invoke handler refuses every op
+   (including the reserved `PMT_OP_APPEND_ROW = 2`) with
+   `INVOKE_UNSUPPORTED`. Compounding this, no `_init_caps`-style
+   convention anywhere in the codebase seeds a standalone, one-shot
+   CLI tool (as opposed to a long-running IPC server, the only
+   precedent found) with a cap slot for this kind.
+
+Given (1) alone, `mount_op_invoke`'s real (non-`--dry-run`) branch
+issues its syscall using the ABI from gap (2)'s documented contract,
+receives `-ENOSYS` today, and classifies the return via a generous
+"plausible mount_id" ceiling (< 65536) rather than matching a specific
+errno bit pattern — deliberately, since gap (2) means the eventual real
+failure mode may not even be `-ENOSYS`. Every non-dry-run invocation
+therefore reports `MOUNT_OP_ERR_KERNEL` today; this is the correct,
+documented M2 landing behaviour. `mount_op_append_row`'s `cap_invoke`
+call (gap 3) is issued against a hardcoded, explicitly-flagged
+placeholder cap slot and its result is discarded — best-effort, the
+same posture every `audit_emit` call site in the kernel already takes
+toward its own side-channel record.
+
+### 10.3 `elevate.pdx` — a real classifier, narrower than §4.2's own table
+
+`Elevate::elevate_needed`'s M1 stub (§5 above) is replaced with a real
+three-bucket prefix classifier: `/home/`, `/mnt/`, `/tmp/` →
+`ELEVATE_NOT_REQUIRED`; `/system/`, `/boot/`, `/dev/` →
+`ELEVATE_REQUIRED`; anything else → a new `ELEVATE_INVALID`. This is
+this issue's own (M2-003) scope, and it is deliberately NARROWER than
+§4.2's real five-class table in two ways, both flagged in the file's
+own header for M3-001 to close: every `/home/**` path is treated as
+never-elevate (§4.2 only exempts the invoker's OWN subtree — this tool
+has no `KIND_USER` identity lookup yet to tell `/home/alice/` from
+`/home/bob/`), and there is no founder-only-elevate bucket at all
+(§4.2's own unmatched default) — `ELEVATE_INVALID` is a refusal
+instead. `main.pdx` treats `ELEVATE_REQUIRED` as a hard stop
+(`result_code: ELEVATION_REQUIRED`, exit 4) and folds `ELEVATE_INVALID`
+into the same `KERNEL_ERROR` bucket (§10.2) uses (exit 3).
+
+### 10.4 `mount_record.pdx` — one unified emitter
+
+`MountRecord::mount_record_emit_result(volume_cap_ptr, mount_point_ptr,
+flags, result_code, mount_id)` replaces M1's dry-run-only call site in
+`main.pdx` (the old `mount_record_emit_dry_run` is kept, unmodified, as
+a still-valid standalone M1 shape — nothing in this repo requires
+removing it). Four `MR_RESULT_*` codes (`DRY_RUN`, `OK`,
+`ELEVATION_REQUIRED`, `KERNEL_ERROR`) select one of four label strings
+at segment 8; `mount_id` prints only on `MR_RESULT_OK`. A shared
+`mount_record_print_decimal` leaf, factored out of the old inline
+digit-conversion loop byte-for-byte, backs both the `flags` field
+(present since M1) and the new `mount_id` field so the div-by-10 loop
+exists exactly once in this file.

@@ -1,0 +1,305 @@
+// src/mount_op.pdx — mount.pdxfs.M2-002 (issue #5) — real sys_mount
+// invocation + mount-table row append via KIND_PDXFS_MOUNT_TABLE.
+//
+// ==========================================================================
+// KERNEL GAP #1 (blocking): sys_mount (sysno 75) is dispatch-unwired
+// ==========================================================================
+//
+// `grep -n sys_mount src/kernel/core/syscall/dispatch.pdx` (paideia-os
+// monorepo, 2026-08-31) shows the LIVE dispatch table's bounds-check
+// chain reads (line 506-509):
+//
+//     cmp rdi, 75;
+//     je dispatch_mount;
+//     cmp rdi, 76;
+//     je dispatch_umount;
+//
+// i.e. `sys_mount` is sysno **75**, not 73 as `sys_mount.pdx`'s own
+// file-header prose still claims (that header predates the R53.M2-001
+// (#1736) renumber forced when sysno 74 was claimed by
+// `blkdev_cap_request` — dispatch.pdx's own comment at that renumber
+// documents the shift explicitly: "sysnos 73/74 -> 75/76"). Trust the
+// live dispatch table (this file's citation), not the stale prose in
+// the sibling syscall body file.
+//
+// The label `dispatch_mount` itself (dispatch.pdx line 1975) is:
+//
+//     dispatch_mount:
+//       mov rax, 0xFFFFFFFFFFFFFFDA;   // -ENOSYS
+//       ret;
+//
+// i.e. it is STILL an unconditional forward-declaration stub that reads
+// NO argument register and ALWAYS returns -ENOSYS, despite
+// `sys_mount_body` / `sys_mount_shim` (same file, `sys_mount.pdx`)
+// already having a complete, real, audit-emitting implementation. The
+// dispatch-table wiring that would tail `dispatch_mount` into
+// `sys_mount_shim` (the same shape `dispatch_open` and
+// `dispatch_blkdev_cap_request` already use for their own path-copy
+// shims) has simply never landed. **A ring-3 caller cannot reach
+// `sys_mount_body` through any syscall today, full stop.**
+//
+// ==========================================================================
+// KERNEL GAP #2: sys_mount_body's real ABI does not accept a cap slot
+// ==========================================================================
+//
+// Even setting gap #1 aside, `dispatch.pdx`'s own forward-declaration
+// comment (lines 1951-1962) documents an ASPIRATIONAL shim contract for
+// sysno 75 that a future wiring pass is expected to implement:
+//
+//     rsi = a0 = volume_cap_slot     (KIND_VOLUME cap)
+//     rdx = a1 = mountpoint_path_va  (user VA, NUL-term, PATH_MAX)
+//     rcx = a2 = flags               (u64)
+//     r8  = a3 = fstype              (u64 backend id)
+//     -> rax = mount_id | -EBADF | -EACCES | -EFAULT | -ENOENT
+//
+// This is the cap-slot-based ABI mount.pdxfs's own design
+// (design/tooling/volume-tooling-ux.md §4, this repo's
+// design/architecture.md §6) targets, and the shape this file's
+// `mount_op_invoke` issues below. But `sys_mount_body`'s ACTUAL,
+// ALREADY-LANDED signature (sys_mount.pdx line 328) is
+//
+//     sys_mount_body(dev_path_ptr, dev_path_len, mount_point_ptr,
+//                     mount_point_len, backend_id) -> u64
+//
+// — five arguments, none of which is a cap slot. It takes a raw DEVICE
+// PATH STRING (copied in by `sys_mount_shim` via
+// `user_read_bytes_via_walk`) and a `backend_id` (0=tmpfs, 5=pdxfs_block
+// — the pdxfs_block arm is itself an unconditional
+// `SYS_MOUNT_UNIMPL_PDXFS_BLOCK` stub, per that file's own §Scaffolding
+// note). There is no code path anywhere in `sys_mount_body` that reads
+// a `KIND_VOLUME` cap slot at all. The dispatch-level comment's
+// documented contract and the syscall body's real implementation
+// describe two DIFFERENT, mutually incompatible ABIs for the same
+// sysno. **Confirm with osarch which ABI sysno 75 is actually meant to
+// grow into before wiring `dispatch_mount` for real** — this is the
+// same "confirm before M2-001" flag this repo's own STATUS.md /
+// architecture.md §6/§9 already raised at M1, now with the concrete
+// evidence of the mismatch.
+//
+// ==========================================================================
+// This file's posture: issue the DESIGNED call, treat any non-success
+// return as the expected M2 outcome
+// ==========================================================================
+//
+// Per this issue's own instruction ("STUB the invocation with a
+// documented placeholder returning success on --dry-run semantics and
+// flag the kernel gap"), `mount_op_invoke` below:
+//
+//   - On `--dry-run` (flags bit 3 set, `Argv::PA_FLAG_DRY_RUN` = 0x8):
+//     issues NO syscall at all. `*out_mount_id_ptr` is written 0 and
+//     the function returns `MOUNT_OP_OK` (0) unconditionally — main.pdx
+//     reads the caller's own dry-run flag to choose the
+//     `result_code: DRY_RUN` label rather than this function
+//     signalling it.
+//   - Otherwise: issues the syscall using the ASPIRATIONAL cap-slot ABI
+//     documented above (sysno 75; rdi=narrowed_volume_slot,
+//     rsi=mount_point_ptr, rdx=flags, r10=backend_id — backend_id is
+//     hardcoded to `MOUNT_OP_BACKEND_PDXFS_BLOCK` (5), the real
+//     `MOUNT_BACKEND_PDXFS_BLOCK` ordinal per
+//     libpdx-volume/src/mount_table_snapshot.pdx's own per-mount-entry
+//     layout note, since a `KIND_VOLUME`-backed mount is definitionally
+//     a pdxfs-block mount). Given gap #1, this call returns -ENOSYS
+//     TODAY, unconditionally, regardless of any argument. Given gap #2,
+//     even once #1 is fixed, `sys_mount_body`'s real signature would
+//     still reject this call shape outright. Any return value outside
+//     a small "plausible mount_id" range (see `MOUNT_OP_ID_CEILING`
+//     below) is therefore treated as `MOUNT_OP_ERR_KERNEL` — this
+//     deliberately does NOT special-case the exact -ENOSYS bit pattern,
+//     since gap #2 means the real failure mode (once #1 lands) could be
+//     a completely different negative errno or an outright link/verify
+//     failure against a still-mismatched ABI.
+//
+// ==========================================================================
+// KERNEL GAP #3: KIND_PDXFS_MOUNT_TABLE has no APPEND_ROW op wired
+// ==========================================================================
+//
+// `src/kernel/core/cap/kind_pdxfs_mount_table.pdx` (§0, §SECTION 6 per
+// that file's own header) reserves `PMT_OP_APPEND_ROW = 2` as an
+// ordinal but its cap-invoke handler "refuses every op with
+// INVOKE_UNSUPPORTED (0xFFFFFFFFFFFFFFFC)" — LIST / READ_ROW /
+// APPEND_ROW are all explicitly DEFERRED past the R53-PREP-001 landing
+// that registered the kind. There is no working row-append op to call.
+//
+// A SECOND, independent gap compounds this: even if APPEND_ROW were
+// wired, no `_init_caps`-style convention exists anywhere in this
+// codebase for seeding a standalone CLI tool's cap table with a
+// `KIND_PDXFS_MOUNT_TABLE` handle (the only precedent found,
+// `audio_supervisor.pdx` / `acpi_supervisor.pdx`, seeds long-running
+// IPC *servers* with fixed endpoint-cap slots at boot — no analogous
+// seeding exists for a one-shot argv-driven tool like this one). This
+// file therefore hardcodes `MOUNT_OP_PMT_CAP_SLOT_PLACEHOLDER` (see
+// below) as an explicitly-flagged STUB value rather than accepting a
+// slot number from anywhere real. `mount_op_append_row`'s
+// `cap_invoke` return is DISCARDED — best-effort, matching this
+// codebase's own `audit_emit` convention of never gating a primary
+// operation's result on a side-channel record's own success (every
+// `audit_emit` call site in `sys_mount.pdx` / `sys_umount.pdx` does the
+// same) — since neither the op nor the cap slot exists yet, there is
+// nothing meaningful this call's return value could tell a caller.
+//
+// ==========================================================================
+// Encoder-gap discipline
+// ==========================================================================
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic; every zero-check is
+// `cmp reg, 0`. Reserved-label discipline: every branch label in this
+// file is prefixed `mount_op_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §4 (paideia-os);
+// design/architecture.md §6/§9 (this repo, the M1 flags this file
+// resolves with concrete kernel-source citations); src/kernel/core/
+// syscall/sys_mount.pdx + dispatch.pdx (paideia-os, gaps #1/#2); src/
+// kernel/core/cap/kind_pdxfs_mount_table.pdx (paideia-os, gap #3).
+
+module MountOp = structure {
+
+  // --- mount_op_invoke status codes. -------------------------------------
+  pub let MOUNT_OP_OK         : u64 = 0
+  pub let MOUNT_OP_ERR_KERNEL : u64 = 1
+
+  // --- SC+ syscall IDs used directly by this file. -----------------------
+  pub let MOUNT_OP_SC_MOUNT      : u64 = 75   // sys_mount (dispatch.pdx L506-507)
+  pub let MOUNT_OP_SC_CAP_INVOKE : u64 = 4    // cap_invoke (dispatch.pdx L400-401)
+
+  // --- backend_id passed to sys_mount -- see module header: a
+  //     KIND_VOLUME-backed mount is definitionally pdxfs-block.
+  //     Matches SYS_MOUNT_BACKEND_PDXFS_BLOCK (sys_mount.pdx L211) /
+  //     the MOUNT_BACKEND_PDXFS_BLOCK=5 ordinal
+  //     (mount_table_snapshot.pdx's own per-mount-entry layout note). --
+  pub let MOUNT_OP_BACKEND_PDXFS_BLOCK : u64 = 5
+
+  // --- KERNEL GAP #3's placeholder cap slot -- see module header. NOT a
+  //     real slot number; no _init_caps convention seeds this tool with
+  //     one. The cap_invoke call this feeds is best-effort and its
+  //     result is discarded regardless of what this constant holds. ---
+  pub let MOUNT_OP_PMT_CAP_SLOT_PLACEHOLDER : u64 = 3
+
+  // --- KIND_PDXFS_MOUNT_TABLE op ordinal -- reserved, not wired
+  //     (kind_pdxfs_mount_table.pdx PMT_OP_APPEND_ROW). ------------------
+  pub let MOUNT_OP_PMT_OP_APPEND_ROW : u64 = 2
+
+  // --- "Plausible mount_id" ceiling for classifying a sys_mount return
+  //     as success vs. kernel error without hardcoding a specific
+  //     errno bit pattern (see module header, gap #1/#2 discussion).
+  //     MOUNT_MAX is 8 (core/fs/mount.pdx); 65536 is a deliberately
+  //     generous ceiling that still safely excludes every -Exxx /
+  //     0xFFFFEDxx sentinel form this codebase uses. ---------------------
+  pub let MOUNT_OP_ID_CEILING : u64 = 65536
+
+  // --- Argv::PA_FLAG_DRY_RUN, reproduced here as a raw immediate per
+  //     this repo's own cross-file constant convention (main.pdx itself
+  //     hardcodes 0x8 rather than referencing Argv::PA_FLAG_DRY_RUN
+  //     symbolically -- pub let u64 constants are compile-time values,
+  //     not linkable data symbols, so every consumer repeats the
+  //     literal with a comment). ------------------------------------------
+  pub let MOUNT_OP_FLAG_DRY_RUN : u64 = 0x8
+
+  // ==========================================================================
+  // mount_op_append_row(mount_id) -> ()
+  //
+  // KERNEL GAP #3 stub. Issues cap_invoke(MOUNT_OP_PMT_CAP_SLOT_PLACEHOLDER,
+  // MOUNT_OP_PMT_OP_APPEND_ROW) via SC+ ID 4 and discards the result --
+  // see module header for why (op unwired server-side; no real cap slot
+  // to pass either). mount_id is accepted as a parameter for API-shape
+  // stability (a real APPEND_ROW op will need it packed into op_arg's
+  // upper bits) but is NOT yet folded into op_arg -- the packing
+  // convention for a still-unspecified op has nothing to conform to.
+  //
+  // Pure leaf at the syscall boundary: rax/rdi/rsi are SysV caller-save,
+  // no push/pop, no branch.
+  // ==========================================================================
+  pub let mount_op_append_row : (u64) -> () !{mem, sysreg} @{cap} =
+    fn (mount_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mount.pdxfs.M2-002 (#5), KERNEL GAP #3 stub: mount_op_append_row entry point. mount_id arrives in rdi but is not yet folded into op_arg (see module header -- no real APPEND_ROW packing convention exists to conform to). Issues `mov rdi, 3 (MOUNT_OP_PMT_CAP_SLOT_PLACEHOLDER); mov rsi, 2 (MOUNT_OP_PMT_OP_APPEND_ROW); mov rax, 4 (MOUNT_OP_SC_CAP_INVOKE); syscall`. Return value in rax discarded -- best-effort per module header, matching every audit_emit call site's own discard-the-side-channel-result convention. No branch, no push/pop -- rax/rdi/rsi are all SysV caller-save. Labels: none (single straight-line block, nothing to prefix).",
+      block: {
+        mov rdi, 3;                          // MOUNT_OP_PMT_CAP_SLOT_PLACEHOLDER
+        mov rsi, 2;                          // MOUNT_OP_PMT_OP_APPEND_ROW
+        mov rax, 4;                          // MOUNT_OP_SC_CAP_INVOKE
+        syscall;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mount_op_invoke(narrowed_volume_slot, mount_point_ptr, flags,
+  //                  out_mount_id_ptr) -> u64 (MOUNT_OP_OK | MOUNT_OP_ERR_KERNEL)
+  //
+  //   rdi = narrowed_volume_slot (from VolumeCap::volume_cap_resolve)
+  //   rsi = mount_point_ptr      (NUL-terminated <mount-point> string)
+  //   rdx = flags                (ParsedArgv.flags, full bitmask)
+  //   rcx = out_mount_id_ptr     (u64 write target; always written --
+  //                               0 on the dry-run path or any kernel
+  //                               error, the syscall's rax on a
+  //                               plausible-looking success)
+  //
+  // See module header for the full gap #1/#2/#3 write-up this function
+  // embodies. Register plan (all SysV callee-save; pushed on entry,
+  // popped in reverse order before every return):
+  //   rbx = narrowed_volume_slot
+  //   r12 = mount_point_ptr
+  //   r13 = flags
+  //   r14 = out_mount_id_ptr
+  // ==========================================================================
+  pub let mount_op_invoke : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
+    fn (narrowed_volume_slot: u64) (mount_point_ptr: u64) (flags: u64) (out_mount_id_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, cap},
+      justification: "mount.pdxfs.M2-002 (#5): mount_op_invoke entry point. SysV callee-save discipline: push rbx/r12/r13/r14 (4 registers, 32 bytes) before repurposing any of them -- popped in reverse order immediately before every return. rbx=narrowed_volume_slot, r12=mount_point_ptr, r13=flags, r14=out_mount_id_ptr, all now-saved callee-save registers surviving the nested `call mount_op_append_row` and every `syscall` (SYSCALL preserves callee-save registers per amd64 fast-syscall convention). Gate: `mov rax, r13; and rax, 0x8 (MOUNT_OP_FLAG_DRY_RUN); cmp rax, 0; jne mount_op_dry_run`. Dry-run arm: `xor rax,rax; mov [r14+0], rax` (mount_id=0, staged through a register rather than a bare imm-to-mem store for width-safety, matching this file's own zero-fill idiom elsewhere), `xor rax, rax` (MOUNT_OP_OK), jmp epilogue -- NO syscall issued, matching this issue's own '--dry-run skips the actual syscall' instruction. Real-mount arm: issues the ASPIRATIONAL cap-slot ABI documented in the module header directly as a raw syscall -- `mov rdi, rbx (narrowed_volume_slot); mov rsi, r12 (mount_point_ptr); mov rdx, r13 (flags); mov r10, 5 (MOUNT_OP_BACKEND_PDXFS_BLOCK); mov rax, 75 (MOUNT_OP_SC_MOUNT); syscall`. Classifies the return via the MOUNT_OP_ID_CEILING sanity band rather than matching a specific errno bit pattern (module header explains why): `mov r11, 65536; cmp rax, r11; jae mount_op_kernel_error`. On a plausible-looking success (rax < 65536): `mov r13, rax` stashes mount_id into r13 (flags is dead past this point, safely repurposed as the surviving callee-save slot mount_op_append_row's own nested call needs) BEFORE calling mount_op_append_row, since that call clobbers rax (caller-save, per its own justification); `mov rdi, r13; call mount_op_append_row` (result discarded per that function's own header); `mov [r14+0], r13` (write mount_id out); `xor rax, rax` (MOUNT_OP_OK); jmp epilogue. mount_op_kernel_error: `xor r10, r10; mov [r14+0], r10` (mount_id=0 on any kernel error), `mov rax, 1` (MOUNT_OP_ERR_KERNEL). Epilogue pops r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` anywhere (every memory write is a plain `mov [reg+0], reg` store, never an add). No `test` mnemonic. Labels prefixed mount_op_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                        // rbx = narrowed_volume_slot
+        mov r12, rsi;                        // r12 = mount_point_ptr
+        mov r13, rdx;                        // r13 = flags
+        mov r14, rcx;                        // r14 = out_mount_id_ptr
+
+        // ---- Gate: --dry-run? (MOUNT_OP_FLAG_DRY_RUN = 0x8) ----------------
+        mov rax, r13;
+        and rax, 0x8;
+        cmp rax, 0;
+        jne mount_op_dry_run;
+
+        // ---- Real path: issue the (unwired-kernel-side) sys_mount call. ---
+        mov rdi, rbx;                        // narrowed_volume_slot
+        mov rsi, r12;                        // mount_point_ptr
+        mov rdx, r13;                        // flags
+        mov r10, 5;                          // MOUNT_OP_BACKEND_PDXFS_BLOCK
+        mov rax, 75;                         // MOUNT_OP_SC_MOUNT
+        syscall;
+
+        mov r11, 65536;                      // MOUNT_OP_ID_CEILING
+        cmp rax, r11;
+        jae mount_op_kernel_error;
+
+        // ---- Plausible-looking success: best-effort append-row. -----------
+        mov r13, rax;                        // r13 = mount_id (flags is dead here)
+        mov rdi, r13;
+        call mount_op_append_row;            // result discarded (see header)
+
+        mov [r14 + 0], r13;                  // *out_mount_id_ptr = mount_id
+        xor rax, rax;                        // MOUNT_OP_OK
+        jmp mount_op_done;
+
+      mount_op_dry_run:
+        xor rax, rax;
+        mov [r14 + 0], rax;                  // *out_mount_id_ptr = 0
+        xor rax, rax;                        // MOUNT_OP_OK
+        jmp mount_op_done;
+
+      mount_op_kernel_error:
+        xor r10, r10;
+        mov [r14 + 0], r10;                  // *out_mount_id_ptr = 0
+        mov rax, 1;                          // MOUNT_OP_ERR_KERNEL
+
+      mount_op_done:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

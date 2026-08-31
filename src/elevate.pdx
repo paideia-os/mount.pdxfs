@@ -1,71 +1,88 @@
-// src/elevate.pdx — mount.pdxfs.M1-001 (scaffold) — elevate-channel
-// placeholder, real body at M3-001.
-//
-// design/tooling/volume-tooling-ux.md §4.2 defines a mount-point-class
-// table gating whether mount.pdxfs must request elevation via
-// KIND_ELEVATE_CHANNEL before calling sys_mount:
-//
-//   /system/**          -- always elevate
-//   /boot/**            -- always elevate
-//   /dev/**             -- always elevate
-//   /mnt/**             -- never
-//   /home/<$user>/**    -- never (own subtree)
-//   /home/<$other>/**   -- founder-only elevate
-//   /tmp/**             -- never
-//   anywhere else       -- founder-only elevate (conservative default)
-//
-// None of that table, and no libpdx-elevate call, exists at M1.
-// mount.pdxfs.M1-003's own dry-run happy path never inspects
-// <mount-point>'s class -- the --dry-run print always succeeds
-// regardless of where the caller points it, and the non-dry-run branch
-// is an unconditional "not yet implemented" exit 1 (src/main.pdx) that
-// never reaches any elevate decision either. This file is therefore a
-// SCAFFOLD, matching mkfs.pdxfs's own "STUB for M1, real body at a
-// later milestone" posture for src/target.pdx.
-//
-// libpdx-elevate availability note: as of this landing, a
-// `grep -rl libpdx-elevate` across the paideia-os monorepo and every
-// repo under paideia-satellites/ finds ZERO implementation files --
-// the same "design-doc-mentioned, not yet bootstrapped" status
-// mkfs.pdxfs.M1-002's own design/architecture.md §3 documents for
-// libpdx-argv (which mount.pdxfs's own src/argv.pdx also works around
-// with a minimal inline parser). elevate_needed below is written to be
-// the same shape (a path-classifying query in, a boolean decision out)
-// a future libpdx-elevate-backed rewrite would present, so a caller
-// added at M3-001 does not need an ABI change when a real
-// classification table and a real KIND_ELEVATE_CHANNEL request/response
-// round-trip replace this stub's body.
+// src/elevate.pdx — mount.pdxfs.M1-001 (scaffold) + M2-003 (issue #6) —
+// user-subtree mount-point classifier. Real `libpdx-elevate` round-trip
+// still lands at M3-001; this file now classifies a mount point into
+// "no elevate needed" / "elevate needed" / "invalid" so main.pdx can
+// gate the M2 real-mount path without ever performing a real elevate
+// request.
 //
 // ----------------------------------------------------------------------
-// M1 stub contract
+// M2-003 classification (this issue's own scope — NARROWER than the
+// full §4.2 table)
 // ----------------------------------------------------------------------
 //
-// elevate_needed ALWAYS returns 0 (not required), regardless of its
-// mount_point_ptr argument -- it does not read a single byte of that
-// string yet. This is deliberately the most permissive possible
-// answer: since no code path in this landing calls sys_mount (the only
-// operation elevation would ever gate), a stub that always says
-// "elevation not required" cannot cause a M1 caller to skip a real
-// safety check that exists nowhere in this repo yet. The mount-point-
-// class table and the real KIND_ELEVATE_CHANNEL request/response
-// exchange are mount.pdxfs.M3-001.
+// design/tooling/volume-tooling-ux.md §4.2's full mount-point-class
+// table (reproduced in this file's own M1 header, still accurate)
+// has FIVE classes: always-elevate (/system, /boot, /dev), never
+// (/mnt, own-subtree /home, /tmp), and founder-only-elevate for
+// cross-user /home and the conservative default. This issue's own M2
+// scope is narrower — exactly THREE buckets, with no founder/cross-user
+// distinction yet (that nuance needs a KIND_USER identity lookup this
+// tool does not have until a later milestone):
 //
-// Not called by any M1 code path (src/main.pdx's _start never
-// references this module) -- it exists at M1 purely to reserve the
-// call-site shape M3-001 will wire in, per this issue's own file-list
-// instruction ("elevate.pdx -- placeholder for elevate-channel logic
-// (M2+)").
+//   ELEVATE_NOT_REQUIRED (0) -- path starts with "/home/", "/mnt/", or
+//                               "/tmp/". Note this is looser than
+//                               §4.2's real table: §4.2 only exempts
+//                               the INVOKER'S OWN "/home/<$user>/" — any
+//                               other user's subtree is founder-only
+//                               elevate. This file cannot yet tell
+//                               "/home/alice/" from "/home/bob/" (no
+//                               KIND_USER identity lookup exists in
+//                               this tool at M2), so EVERY "/home/**"
+//                               path is treated as never-elevate for
+//                               now. **Flagged for main / M3-001**:
+//                               this is a real over-permissive gap that
+//                               must narrow to own-subtree-only once
+//                               invoker identity is available.
+//   ELEVATE_REQUIRED     (1) -- path starts with "/system/", "/boot/",
+//                               or "/dev/". Matches §4.2 exactly for
+//                               these three classes.
+//   ELEVATE_INVALID      (2) -- anything else (including a NUL/empty
+//                               string, or a path matching none of the
+//                               six prefixes above). §4.2's own table
+//                               has no "invalid" bucket -- its
+//                               unmatched default is "founder-only
+//                               elevate", not a refusal. This issue's
+//                               own instruction asks for a distinct
+//                               "invalid" return value for the
+//                               unmatched case rather than reusing
+//                               ELEVATE_REQUIRED, so main.pdx can tell
+//                               "elevate and proceed" apart from
+//                               "nothing here to classify" -- the
+//                               founder-only-elevate default itself is
+//                               still M3-001 scope, same as the
+//                               cross-user /home nuance above.
+//
+// main.pdx's M2 pipeline treats ELEVATE_REQUIRED (1) as a hard stop:
+// it emits a PdxFsMountRecord@0.1 with result_code: ELEVATION_REQUIRED
+// and exits without ever calling MountOp::mount_op_invoke -- per this
+// issue's own instruction, "M3-001 wires libpdx-elevate" is what
+// eventually replaces that hard stop with a real request/response
+// round trip. ELEVATE_INVALID (2) is likewise treated as a refusal by
+// main.pdx (mapped to result_code: KERNEL_ERROR at M2 -- there is no
+// dedicated "invalid mount point class" result_code yet; see
+// mount_record.pdx's own header for the four result_codes M2 carries).
+//
+// ----------------------------------------------------------------------
+// Matching strategy
+// ----------------------------------------------------------------------
+//
+// Six fixed-length literal PREFIXES (not full-string matches --
+// "/home/alice/data" must match "/home/" without requiring the whole
+// string to equal it). Reuses the byte-loop zero-extension idiom every
+// other parser in this repo uses (Argv::argv_streq,
+// VolumeCap::volume_cap_parse_slot's own prefix-check phase); a
+// dedicated `mount_elev_prefix_match(str_ptr, lit_ptr, lit_len) -> u64`
+// helper is shared across all six checks rather than inlining the loop
+// six times.
 //
 // ----------------------------------------------------------------------
 // Encoder-gap discipline
 // ----------------------------------------------------------------------
 //
-// No `add reg, [mem]` anywhere. No `test` mnemonic; every zero-check is
-// `cmp reg, 0`. Reserved-label discipline: not applicable yet -- this
-// stub's one function has no internal branch, hence no label to
-// prefix; a future real body's labels will use the `mount_elevate_`
-// prefix, matching this repo's other three files' per-file prefix
-// convention.
+// No `add reg, [mem]` anywhere. Every byte load uses the
+// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom. No `test`
+// mnemonic; every zero-check is `cmp reg, 0`. Reserved-label
+// discipline: every branch label in this file is prefixed `mount_elev_`.
 //
 // Upstream: design/tooling/volume-tooling-ux.md §4.2 (paideia-os).
 
@@ -74,30 +91,150 @@ module Elevate = structure {
   // --- elevate_needed return values. --------------------------------------
   pub let ELEVATE_NOT_REQUIRED : u64 = 0
   pub let ELEVATE_REQUIRED     : u64 = 1
+  pub let ELEVATE_INVALID      : u64 = 2
+
+  // --- Never-elevate prefixes (checked first). ----------------------------
+  pub let elev_lit_home : [u8; 7] = "/home/\0"
+  pub let ELEV_LEN_HOME : u64 = 6
+
+  pub let elev_lit_mnt : [u8; 6] = "/mnt/\0"
+  pub let ELEV_LEN_MNT : u64 = 5
+
+  pub let elev_lit_tmp : [u8; 6] = "/tmp/\0"
+  pub let ELEV_LEN_TMP : u64 = 5
+
+  // --- Always-elevate prefixes (checked second). --------------------------
+  pub let elev_lit_system : [u8; 9] = "/system/\0"
+  pub let ELEV_LEN_SYSTEM : u64 = 8
+
+  pub let elev_lit_boot : [u8; 7] = "/boot/\0"
+  pub let ELEV_LEN_BOOT : u64 = 6
+
+  pub let elev_lit_dev : [u8; 6] = "/dev/\0"
+  pub let ELEV_LEN_DEV : u64 = 5
 
   // ==========================================================================
-  // elevate_needed(mount_point_ptr) -> u64 (ELEVATE_NOT_REQUIRED | ELEVATE_REQUIRED)
+  // mount_elev_prefix_match(str_ptr, lit_ptr, lit_len) -> u64
+  //     (1 = str_ptr's first lit_len bytes equal lit_ptr's; 0 = not)
   //
-  // mount_point_ptr in rdi: a NUL-terminated <mount-point> string,
-  // typically ParsedArgv.mount_point_ptr from Argv::argv_parse. M1
-  // STUB: unconditionally returns ELEVATE_NOT_REQUIRED without
-  // inspecting mount_point_ptr at all -- see module header for why this
-  // is a safe default at M1 (no caller anywhere in this repo yet uses
-  // the result to gate a real sys_mount call). The real mount-point-
-  // class classification (§4.2's table: /system, /boot, /dev always
-  // elevate; /home/<other> and the conservative default are
-  // founder-only elevate; everything else never elevates) is
-  // mount.pdxfs.M3-001.
+  // Pure leaf, byte-loop compare, identical shape to
+  // VolumeCap::volume_cap_parse_slot's own prefix-check phase. rax/rcx
+  // are the only scratch registers beyond the three SysV caller-save
+  // arg registers -- no push/pop, no nested call.
+  // ==========================================================================
+  pub let mount_elev_prefix_match : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) (lit_ptr: u64) (lit_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M2-003 (#6): mount_elev_prefix_match entry point. rdi=str_ptr, rsi=lit_ptr, rdx=lit_len. Byte loop over i in [0, lit_len): xor+mov_b loads str_ptr[i] into rax and lit_ptr[i] into rcx (zero-extended per paideia-as #1248 workaround); `cmp rax, rcx; jne mount_elev_pm_no` on any mismatch; else `add rdi,1; add rsi,1; add rdx... ` -- wait, lit_len is the loop bound, not a cursor to decrement; the loop instead tracks a separate index r8 against rdx (the bound) so rdx itself stays the untouched original bound for a defensive re-read if ever needed, though this function does not re-read it. `xor r8,r8` before the loop; `cmp r8, rdx; jge mount_elev_pm_yes` (all lit_len bytes matched, including the len==0 degenerate case which matches trivially); load str_ptr[r8] / lit_ptr[r8] via mov_b with r8 as the index register (`mov_b rax,[rdi+r8]` / `mov_b rcx,[rsi+r8]`); compare; on mismatch jump mount_elev_pm_no; else `add r8,1; jmp` the loop head. mount_elev_pm_yes: `mov rax,1; ret`. mount_elev_pm_no: `xor rax,rax; ret`. Pure leaf -- rax/rcx/rdi/rsi/rdx/r8 all SysV caller-save, no push/pop. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed mount_elev_pm_.",
+      block: {
+        xor r8, r8;                          // r8 = index
+
+      mount_elev_pm_loop:
+        cmp r8, rdx;
+        jge mount_elev_pm_yes;
+
+        xor rax, rax;
+        mov_b rax, [rdi + r8];
+        xor rcx, rcx;
+        mov_b rcx, [rsi + r8];
+        cmp rax, rcx;
+        jne mount_elev_pm_no;
+
+        add r8, 1;
+        jmp mount_elev_pm_loop;
+
+      mount_elev_pm_yes:
+        mov rax, 1;
+        ret;
+
+      mount_elev_pm_no:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // elevate_needed(mount_point_ptr) -> u64
+  //     (ELEVATE_NOT_REQUIRED | ELEVATE_REQUIRED | ELEVATE_INVALID)
   //
-  // Pure leaf: rax/rdi are SysV caller-save; no push/pop, no nested
-  // call, no branch.
+  // Real M2-003 body, replacing the M1 "always returns not-required"
+  // scaffold. mount_point_ptr in rdi: a NUL-terminated <mount-point>
+  // string, typically ParsedArgv.mount_point_ptr from Argv::argv_parse.
+  // Checked in this fixed order: /home/, /mnt/, /tmp/ (never-elevate);
+  // then /system/, /boot/, /dev/ (always-elevate); anything matching
+  // none of the six is ELEVATE_INVALID. See module header for exactly
+  // how this narrows §4.2's own five-class table.
+  //
+  // Register plan: rbx = mount_point_ptr, the only SysV callee-save
+  // register this function repurposes (pushed on entry, popped before
+  // every return) -- it must survive six nested `call
+  // mount_elev_prefix_match` invocations, each of which clobbers only
+  // caller-save registers per that function's own justification.
   // ==========================================================================
   pub let elevate_needed : (u64) -> u64 !{mem} @{} =
     fn (mount_point_ptr: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "mount.pdxfs.M1-001 (scaffold): elevate_needed entry point, an M2+ placeholder per this issue's own file-list instruction. mount_point_ptr arrives in rdi but is never dereferenced or otherwise inspected -- the M1 stub body is exactly `xor rax, rax; ret`, unconditionally returning ELEVATE_NOT_REQUIRED (0) regardless of the argument. This is safe at M1 because no caller anywhere in this repo (src/main.pdx's _start included) invokes this function or uses any elevate decision to gate a real sys_mount call -- the real mount-point-class table (§4.2) and the KIND_ELEVATE_CHANNEL request/response round-trip this function will eventually wrap are mount.pdxfs.M3-001. Declared `effects: {mem}` (matching every other leaf helper in this repo's module-level convention) even though this stub body touches no memory -- the real M3-001 body will need to read mount_point_ptr's bytes, and keeping the effect annotation stable now avoids a signature churn at that milestone. Pure leaf -- rax/rdi are SysV caller-save, no push/pop, no branch, hence no label to prefix.",
+      justification: "mount.pdxfs.M2-003 (#6): elevate_needed real body. SysV callee-save discipline: push rbx before repurposing it -- popped before every return. rbx=mount_point_ptr, survives the six nested `call mount_elev_prefix_match` invocations below. Checks, in order: (1) rdi=rbx, rsi=&elev_lit_home (rip-relative lea), rdx=6 (ELEV_LEN_HOME); call; cmp rax,0; jne mount_elev_not_required. (2) same shape against elev_lit_mnt/5. (3) same against elev_lit_tmp/5. (4) elev_lit_system/8 -> on match, jne mount_elev_required. (5) elev_lit_boot/6. (6) elev_lit_dev/5. Falling through all six -> mount_elev_invalid (rax=2). mount_elev_not_required: rax=0. mount_elev_required: rax=1. All three arms pop rbx then ret. No `add reg,[mem]`, no `test` mnemonic. Labels prefixed mount_elev_.",
       block: {
-        xor rax, rax;
+        push rbx;
+        mov rbx, rdi;                        // rbx = mount_point_ptr
+
+        // ---- Never-elevate: /home/, /mnt/, /tmp/ ---------------------------
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_home];
+        mov rdx, 6;                          // ELEV_LEN_HOME
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_not_required;
+
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_mnt];
+        mov rdx, 5;                          // ELEV_LEN_MNT
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_not_required;
+
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_tmp];
+        mov rdx, 5;                          // ELEV_LEN_TMP
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_not_required;
+
+        // ---- Always-elevate: /system/, /boot/, /dev/ -----------------------
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_system];
+        mov rdx, 8;                          // ELEV_LEN_SYSTEM
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_required;
+
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_boot];
+        mov rdx, 6;                          // ELEV_LEN_BOOT
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_required;
+
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_dev];
+        mov rdx, 5;                          // ELEV_LEN_DEV
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_required;
+
+        mov rax, 2;                          // ELEVATE_INVALID
+        jmp mount_elev_done;
+
+      mount_elev_not_required:
+        xor rax, rax;                        // ELEVATE_NOT_REQUIRED
+        jmp mount_elev_done;
+
+      mount_elev_required:
+        mov rax, 1;                          // ELEVATE_REQUIRED
+
+      mount_elev_done:
+        pop rbx;
         ret;
       }
     }

@@ -1,4 +1,5 @@
-// src/main.pdx — mount.pdxfs.M1-001 (scaffold) + M1-003 (#3) — _start
+// src/main.pdx — mount.pdxfs.M1-001 (scaffold) + M1-003 (#3) + M2-001/
+// M2-002/M2-003 (#4/#5/#6) — _start
 //
 // mount.pdxfs is a standalone ring-3 ELF, not a library: this file is
 // its `_start` entry point, argv-wired per the frozen execve ABI
@@ -9,45 +10,71 @@
 //   pointers -- no walker or syscall needed to dereference argv[i]),
 //   rdx = envp (unused by this tool), rsp % 16 == 0 at entry.
 //
-// M1 flow (mount.pdxfs.M1-003, issue #3):
+// ----------------------------------------------------------------------
+// M2 flow (issues #4, #5, #6) — replaces M1's dry-run-only / "not yet
+// implemented" pair with the real pipeline
+// ----------------------------------------------------------------------
 //
-//   1. Parse argv via Argv::argv_parse (src/argv.pdx, #2). On
-//      ARGV_ERR_MISSING_VOLUME_CAP or ARGV_ERR_MISSING_MOUNT_POINT,
-//      print the matching usage diagnostic to fd 2 and exit 2 (matches
-//      design/tooling/volume-tooling-ux.md §4.4's exit-code convention
-//      of using a distinct low exit code for a malformed invocation,
-//      extended here -- same as mkfs.pdxfs.M1-003 -- to cover a missing
-//      positional as the same misuse class).
-//   2. If --dry-run is set: call MountRecord::mount_record_emit_dry_run
-//      (src/mount_record.pdx, #3) to print the PdxFsMountRecord@0.1
-//      line, then exit 0. Unlike mkfs.pdxfs, there is no target-
-//      taxonomy gate here -- mount.pdxfs's --dry-run happy path is not
-//      scoped to any particular <volume-cap> or <mount-point> shape at
-//      M1 (this tool's own task brief has no target-classification
-//      concept analogous to mkfs.pdxfs's file-vs-device-cap split).
-//   3. Otherwise (no --dry-run): print "mount.pdxfs: not yet
-//      implemented\n" to fd 2 and exit 1 -- the real write path
-//      (volume-cap resolution + narrow, sys_mount, mount-table row
-//      append) lands at mount.pdxfs.M2 per
-//      design/tooling/volume-tooling-ux.md §9.2.
+//   1. Parse argv via Argv::argv_parse (src/argv.pdx, #2), unchanged
+//      from M1: on a missing positional, print the matching usage
+//      diagnostic to fd 2 and exit 2.
+//   2. Classify <mount-point> via Elevate::elevate_needed (src/
+//      elevate.pdx, #6): ELEVATE_REQUIRED (1) short-circuits straight
+//      to a PdxFsMountRecord@0.1 with result_code: ELEVATION_REQUIRED
+//      and exit 4 -- M3-001 is what eventually replaces this hard stop
+//      with a real libpdx-elevate round trip. ELEVATE_INVALID (2) is
+//      folded into the same KERNEL_ERROR path step 5 describes (no
+//      dedicated result_code exists for "unclassifiable mount point"
+//      at M2 -- see mount_record.pdx's own header for the four
+//      result_codes this milestone carries).
+//   3. Resolve + narrow <volume-cap> via VolumeCap::volume_cap_resolve
+//      (src/volume_cap.pdx, #4): a non-VC_OK return (bad URI, or a
+//      narrow refusal) is a KERNEL_ERROR per step 5.
+//   4. Call MountOp::mount_op_invoke (src/mount_op.pdx, #5) with the
+//      narrowed slot + mount-point + full flags bitmask. See that
+//      file's own header for the two kernel-side gaps (sys_mount is
+//      dispatch-unwired; even once wired, its real body's ABI does not
+//      accept a cap slot) that mean this call ALWAYS returns
+//      MOUNT_OP_ERR_KERNEL on any non-dry-run invocation today -- this
+//      is the expected, documented M2 landing behaviour, not a bug in
+//      this file.
+//   5. Emit exactly one PdxFsMountRecord@0.1 via MountRecord::
+//      mount_record_emit_result (src/mount_record.pdx, extended for
+//      M2) on every path:
+//        - mount_op_invoke failure (or step 2/3's own refusals) ->
+//          result_code: KERNEL_ERROR, exit 3.
+//        - step 2's ELEVATE_REQUIRED -> result_code:
+//          ELEVATION_REQUIRED, exit 4 (both codes per
+//          design/tooling/volume-tooling-ux.md §4.4's own SYSCALL_ERROR
+//          (3) / NO_PERMISSION-adjacent (4) buckets).
+//        - success with --dry-run set -> result_code: DRY_RUN, exit 0
+//          (mount_op_invoke's own --dry-run gate skips the syscall
+//          entirely, per this issue's own instruction; this file only
+//          decides WHICH label to print).
+//        - success without --dry-run -> result_code: OK plus the
+//          returned mount_id, exit 0 -- unreachable today per step 4's
+//          own gap note, kept for when the kernel-side gaps close.
 //
 // ----------------------------------------------------------------------
 // Register plan
 // ----------------------------------------------------------------------
 //
-// All callee-save (SysV rbx/r12-r15), so they survive the nested
-// `call`s (argv_parse, mount_record_emit_dry_run) without any
-// additional push/pop at this level -- each callee clobbers only
-// caller-save registers or explicitly saves/restores its own
-// callee-save use per its own justification, and SYSCALL preserves
-// callee-save registers by the amd64 fast-syscall convention:
+// All callee-save (SysV rbx/r12-r15), so they survive every nested
+// `call` below without any additional push/pop at this level -- each
+// callee clobbers only caller-save registers or explicitly saves/
+// restores its own callee-save use per its own justification, and
+// SYSCALL preserves callee-save registers by the amd64 fast-syscall
+// convention:
 //
-//   r12 = argc (saved immediately from rdi, before any call)
-//   r13 = argv (saved immediately from rsi)
-//   r14 = &mount_argv_out (the ParsedArgv scratch struct, lea'd once)
-//   rbx = ParsedArgv.flags (loaded once after argv_parse succeeds)
-//   r15 = ParsedArgv.volume_cap_ptr (loaded once after argv_parse
-//         succeeds)
+//   r14 = &ParsedArgv (the scratch struct; only needed transiently to
+//         load the three fields below, then dead)
+//   rbx = ParsedArgv.flags (loaded once, held for the rest of _start --
+//         both the elevate/mount-op calls and the final dry-run-vs-OK
+//         gate read it)
+//   r15 = ParsedArgv.volume_cap_ptr (held for the rest of _start; every
+//         emit call needs the raw URI string, not the narrowed slot)
+//   r12 = ParsedArgv.mount_point_ptr (held for the rest of _start; both
+//         elevate_needed and every downstream call need it)
 //
 // ----------------------------------------------------------------------
 // Encoder-gap discipline
@@ -57,9 +84,9 @@
 // `cmp reg, 0`. Reserved-label discipline: every branch label in this
 // file is prefixed `mount_main_`.
 //
-// SC+ IDs used (same frozen ordinals every src/user/*.pdx binary in the
-// paideia-os monorepo uses, and the same two mkfs.pdxfs.M1-003 uses):
-// 1 = sys_write(fd, buf, count), 60 = sys_exit(status).
+// SC+ IDs used directly by this file: 60 = sys_exit. (sys_write for the
+// two usage diagnostics.) mount_op_invoke and mount_record_emit_result
+// own every other syscall this binary issues.
 //
 // Upstream: design/tooling/volume-tooling-ux.md §4 (paideia-os);
 // design/user/execve-abi.md (paideia-os, the frozen argv ABI this
@@ -74,6 +101,12 @@ module Main = structure {
   // somehow skipped.
   pub let mut mount_argv_out : [u8; 24] = uninit @align(8)
 
+  // --- M2 scratch: the narrowed KIND_VOLUME cap slot (VolumeCap::
+  //     volume_cap_resolve's out-param) and the mount_id MountOp::
+  //     mount_op_invoke returns (0 on dry-run or any kernel error). ----
+  pub let mut mount_narrowed_slot : u64 = uninit @align(8)
+  pub let mut mount_id_out        : u64 = uninit @align(8)
+
   // --- Diagnostic messages (fd 2). -----------------------------------------
   pub let mount_msg_missing_volume_cap     : [u8; 33] = "mount.pdxfs: missing volume-cap\n\0"
   pub let mount_msg_missing_volume_cap_len : u64 = 32
@@ -81,18 +114,15 @@ module Main = structure {
   pub let mount_msg_missing_mount_point     : [u8; 34] = "mount.pdxfs: missing mount-point\n\0"
   pub let mount_msg_missing_mount_point_len : u64 = 33
 
-  pub let mount_msg_not_implemented     : [u8; 34] = "mount.pdxfs: not yet implemented\n\0"
-  pub let mount_msg_not_implemented_len : u64 = 33
-
   // ==========================================================================
   // _start -- user program entry point. Never returns (every terminal
   // path ends in sys_exit).
   // ==========================================================================
-  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
     fn () -> unsafe {
       effects: {mem, sysreg},
-      capabilities: {fs, sched},
-      justification: "mount.pdxfs.M1-001 (scaffold) + M1-003 (#3): mount.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below. Phase 1: rdi=r12, rsi=r13, rdx=&mount_argv_out (rip-relative lea), call argv_parse (src/argv.pdx, #2). On ARGV_ERR_MISSING_VOLUME_CAP (rax==1): jump to mount_main_missing_volume_cap: sys_write(2, mount_msg_missing_volume_cap, 32), sys_exit(2). On ARGV_ERR_MISSING_MOUNT_POINT (rax==2): jump to mount_main_missing_mount_point: sys_write(2, mount_msg_missing_mount_point, 33), sys_exit(2) -- exit code 2 for both missing-positional cases matches design/tooling/volume-tooling-ux.md §4.4's low-exit-code convention for a malformed invocation, extended here (same posture as mkfs.pdxfs.M1-003) to cover a missing positional as the same misuse class. Phase 2 (on ARGV_OK, rax==0): r14 = &mount_argv_out (rip-relative lea, held for the rest of _start); rbx = [r14+0] (ParsedArgv.flags, Argv::PA_OFF_FLAGS); r15 = [r14+8] (ParsedArgv.volume_cap_ptr, Argv::PA_OFF_VOLUME_CAP_PTR). Gate: rax = rbx & 0x8 (Argv::PA_FLAG_DRY_RUN); cmp rax, 0; je mount_main_not_implemented when --dry-run was not given. On --dry-run set: rdi = r15 (volume_cap_ptr), rsi = [r14+16] (ParsedArgv.mount_point_ptr, Argv::PA_OFF_MOUNT_POINT_PTR), rdx = rbx (flags, the full ParsedArgv.flags bitmask); call mount_record_emit_dry_run (src/mount_record.pdx, #3) -- prints the PdxFsMountRecord@0.1 line to fd 1. Then sys_exit(0). mount_main_not_implemented: sys_write(2, mount_msg_not_implemented, 33), sys_exit(1) -- the real write path (volume-cap resolve+narrow, sys_mount, mount-table row append) is mount.pdxfs.M2, not yet implemented. Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders for the impossible fallthrough, matching every other _start in the paideia-os monorepo's src/user/ tree and mkfs.pdxfs's own main.pdx. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mount_main_.",
+      capabilities: {fs, sched, cap},
+      justification: "mount.pdxfs.M1-001/M1-003 (#3) + M2-001/M2-002/M2-003 (#4/#5/#6): mount.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below -- r12/r13 are then REPURPOSED once argv_parse returns (argc/argv are dead past that point; r12 becomes mount_point_ptr for the rest of the function, matching the module header's register plan). Phase 1 (unchanged from M1): rdi=r12(argc), rsi=r13(argv), rdx=&mount_argv_out, call argv_parse. On ARGV_ERR_MISSING_VOLUME_CAP (rax==1) or ARGV_ERR_MISSING_MOUNT_POINT (rax==2), print the matching fd-2 diagnostic and sys_exit(2) -- identical to M1. Phase 2 (on ARGV_OK): r14=&ParsedArgv; rbx=[r14+0] (flags); r15=[r14+8] (volume_cap_ptr); r12=[r14+16] (mount_point_ptr) -- r14 is dead after these three loads. Phase 3 (elevate classification, #6): rdi=r12; call elevate_needed -> rax in {0,1,2}. rax==1 (ELEVATE_REQUIRED) -> mount_main_elevation_required (emits result_code: ELEVATION_REQUIRED, exit 4). rax==2 (ELEVATE_INVALID) -> mount_main_kernel_error (folded into the same KERNEL_ERROR bucket; see module header). rax==0 falls through. Phase 4 (volume-cap resolve, #4): rdi=r15 (volume_cap_ptr), rsi=&mount_narrowed_slot (rip-relative lea); call volume_cap_resolve -> rax in {0,1,2}; non-zero -> mount_main_kernel_error. Phase 5 (mount op, #5): rdi=[rip+mount_narrowed_slot] (a plain memory-operand load, not `add reg,[mem]`), rsi=r12 (mount_point_ptr), rdx=rbx (full flags bitmask), rcx=&mount_id_out (rip-relative lea); call mount_op_invoke -> rax in {0,1}; non-zero (MOUNT_OP_ERR_KERNEL) -> mount_main_kernel_error -- per mount_op.pdx's own header this is the ALWAYS-taken branch for any non-dry-run invocation today (sys_mount is kernel-side unwired), which is the expected M2 landing behaviour. Phase 6 (success path): re-test rbx & 0x8 (Argv::PA_FLAG_DRY_RUN) to choose DRY_RUN vs OK -- mount_op_invoke's own dry-run gate already skipped the syscall internally; this second test only selects which result_code label to print, since mount_op_invoke's return alone cannot distinguish 'dry-run success' from 'real success' (both are MOUNT_OP_OK). On the dry-run branch: rdi=r15, rsi=r12, rdx=rbx, rcx=0 (MR_RESULT_DRY_RUN), r8=0 (mount_id unused); call mount_record_emit_result; exit 0. On the real-success branch: same four args plus rcx=1 (MR_RESULT_OK), r8=[rip+mount_id_out]; call mount_record_emit_result; exit 0. mount_main_elevation_required / mount_main_kernel_error each call mount_record_emit_result with rcx=2/3 respectively and r8=0 (mount_id not meaningful on either path), then exit 4 / exit 3 respectively -- the exit-code choice mirrors design/tooling/volume-tooling-ux.md §4.4's own SYSCALL_ERROR(3)/permission-adjacent(4) buckets. Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders for the impossible fallthrough, matching every other _start in the paideia-os monorepo's src/user/ tree. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mount_main_.",
       block: {
         mov r12, rdi;                       // r12 = argc
         mov r13, rsi;                       // r13 = argv
@@ -139,33 +169,86 @@ module Main = structure {
 
         mov rbx, [r14 + 0];                  // rbx = flags (Argv::PA_OFF_FLAGS)
         mov r15, [r14 + 8];                  // r15 = volume_cap_ptr (Argv::PA_OFF_VOLUME_CAP_PTR)
+        mov r12, [r14 + 16];                 // r12 = mount_point_ptr (Argv::PA_OFF_MOUNT_POINT_PTR)
 
-        // ---- Gate: --dry-run set? (Argv::PA_FLAG_DRY_RUN = 0x8) -----------
+        // ---- Phase 3: elevate classification (#6). -------------------------
+        mov rdi, r12;
+        call elevate_needed;
+
+        cmp rax, 1;                          // ELEVATE_REQUIRED
+        je mount_main_elevation_required;
+
+        cmp rax, 2;                          // ELEVATE_INVALID
+        je mount_main_kernel_error;
+
+        // ---- Phase 4: volume-cap resolve + narrow (#4). --------------------
+        mov rdi, r15;
+        lea rsi, [rip + mount_narrowed_slot];
+        call volume_cap_resolve;
+
+        cmp rax, 0;                          // VC_OK
+        jne mount_main_kernel_error;
+
+        // ---- Phase 5: real sys_mount + mount-table append (#5). ------------
+        mov rdi, [rip + mount_narrowed_slot];
+        mov rsi, r12;
+        mov rdx, rbx;
+        lea rcx, [rip + mount_id_out];
+        call mount_op_invoke;
+
+        cmp rax, 0;                          // MOUNT_OP_OK
+        jne mount_main_kernel_error;
+
+        // ---- Phase 6: success -- DRY_RUN vs OK depends on the flag. --------
         mov rax, rbx;
-        and rax, 0x8;
+        and rax, 0x8;                        // Argv::PA_FLAG_DRY_RUN
         cmp rax, 0;
-        je mount_main_not_implemented;
+        jne mount_main_emit_dry_run;
 
-        // ---- --dry-run: emit the mount record. -----------------------------
-        mov rdi, r15;                        // volume_cap_ptr
-        mov rsi, [r14 + 16];                 // mount_point_ptr (Argv::PA_OFF_MOUNT_POINT_PTR)
-        mov rdx, rbx;                        // flags
-        call mount_record_emit_dry_run;
+        mov rdi, r15;
+        mov rsi, r12;
+        mov rdx, rbx;
+        mov rcx, 1;                          // MR_RESULT_OK
+        mov r8, [rip + mount_id_out];
+        call mount_record_emit_result;
 
         xor rdi, rdi;                        // status = 0 (OK)
-        mov rax, 60;                          // SC+ ID 60 = sys_exit
-        syscall;
-        hlt;
+        jmp mount_main_exit;
 
-      mount_main_not_implemented:
-        mov rdi, 2;                          // fd = stderr
-        lea rsi, [rip + mount_msg_not_implemented];
-        mov rdx, 33;                         // mount_msg_not_implemented_len
-        mov rax, 1;                          // SC+ ID 1 = sys_write
-        syscall;
+      mount_main_emit_dry_run:
+        mov rdi, r15;
+        mov rsi, r12;
+        mov rdx, rbx;
+        mov rcx, 0;                          // MR_RESULT_DRY_RUN
+        xor r8, r8;                          // mount_id unused
+        call mount_record_emit_result;
 
-        mov rdi, 1;                          // status = 1
-        mov rax, 60;                          // SC+ ID 60 = sys_exit
+        xor rdi, rdi;                        // status = 0 (OK)
+        jmp mount_main_exit;
+
+      mount_main_elevation_required:
+        mov rdi, r15;
+        mov rsi, r12;
+        mov rdx, rbx;
+        mov rcx, 2;                          // MR_RESULT_ELEVATION_REQUIRED
+        xor r8, r8;                          // mount_id unused
+        call mount_record_emit_result;
+
+        mov rdi, 4;                          // status = 4
+        jmp mount_main_exit;
+
+      mount_main_kernel_error:
+        mov rdi, r15;
+        mov rsi, r12;
+        mov rdx, rbx;
+        mov rcx, 3;                          // MR_RESULT_KERNEL_ERROR
+        xor r8, r8;                          // mount_id unused
+        call mount_record_emit_result;
+
+        mov rdi, 3;                          // status = 3
+
+      mount_main_exit:
+        mov rax, 60;                         // SC+ ID 60 = sys_exit
         syscall;
         hlt
       }

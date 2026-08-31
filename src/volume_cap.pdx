@@ -1,0 +1,283 @@
+// src/volume_cap.pdx — mount.pdxfs.M2-001 (issue #4) — volume-cap
+// resolution + narrow via libpdx-volume.vol_kind_narrow.
+//
+// design/tooling/volume-tooling-ux.md §4.1 defines `<volume-cap>` as a
+// `KIND_VOLUME` cap URI string, e.g. `cap:volume:0x0042`, looked up in
+// the invoker's cap environment. This file:
+//
+//   1. Parses that URI string into a raw cap-slot number
+//      (`volume_cap_parse_slot`) — the "0x0042" tail decoded as
+//      hexadecimal.
+//   2. Narrows the slot to a mount+query-scoped sub-cap via
+//      libpdx-volume's `vol_kind_narrow` (`volume_cap_resolve`, the
+//      module's one public entry point main.pdx calls).
+//
+// ----------------------------------------------------------------------
+// KIND check — a documented gap, not an oversight
+// ----------------------------------------------------------------------
+//
+// This issue's own brief asks step 2 to "validate the cap slot
+// references a KIND_VOLUME" via `cap_check_kind` or an equivalent
+// kernel primitive. A `grep -rn "cap_check_kind\|cap_slot_kind\|fn
+// cap_kind"` across the entire paideia-os monorepo's `src/kernel/`
+// tree (2026-08-31) finds ZERO such primitive — no ring-3-reachable
+// syscall or kernel-callable helper reports a cap slot's `kind` tag
+// back to a caller holding only the slot number. `cap_invoke`'s own
+// per-kind dispatch (core/cap/invoke.pdx) reads a slot's descriptor
+// kind internally to route to the right handler, but that decode is
+// not exposed as a standalone query. **Flagged for main**: a real
+// KIND_VOLUME membership check needs either (a) a new
+// `cap_query_kind(slot) -> u64` kernel primitive, or (b) reusing
+// `vol_kind_narrow` itself as the gate (it is, after all, a
+// `KIND_VOLUME`-scoped op — a slot of the wrong kind would need its
+// OWN kind's narrow entry point, and libpdx-volume's `vol_kind_narrow`
+// has no kind check of its own either; see that file's own header —
+// "no kernel-side cap_narrow primitive exists yet", it is a documented
+// validate-and-passthrough over `requested_ops_mask` only). Given
+// neither exists, `volume_cap_resolve` below performs NO independent
+// kind check — it trusts the caller-supplied slot number and defers
+// entirely to whatever `vol_kind_narrow` (or, eventually, a real
+// `sys_mount` gate) enforces. A cap slot of the wrong kind passed here
+// narrows "successfully" (passthrough) and only fails once `sys_mount`
+// itself rejects it — acceptable at M2 because `sys_mount` is itself
+// unwired kernel-side (see `src/mount_op.pdx`'s own header for that
+// gap) and so no code path here can cause real harm through an
+// unchecked kind.
+//
+// ----------------------------------------------------------------------
+// ops_mask — VOL_MOUNT|VOL_QUERY, a placeholder pair (see caps.decl)
+// ----------------------------------------------------------------------
+//
+// caps.decl (M1) already flags that the landed `KIND_VOLUME` op catalog
+// (src/kernel/core/cap/kind_volume.pdx: `VOL_OP_QUERY_DEVICE_SLOT`(0)
+// through `VOL_OP_DEBUG_PRINT`(9), `VOL_OP_MAX`=9) has no `VOL_OP_MOUNT`
+// ordinal — "mount+query" is a RIGHTS-band description, not a specific
+// op name. Per this issue's own instruction ("ops_mask =
+// VOL_MOUNT|VOL_QUERY, bits 0..1 of the ops catalog if that's the
+// convention"), `VC_OPS_MOUNT_QUERY` below is `0x3` — bits 0 and 1,
+// which land on the real ordinals `VOL_OP_QUERY_DEVICE_SLOT`(0) and
+// `VOL_OP_QUERY_MOUNT_SLOT`(1). This is a DOCUMENTED STAND-IN for a
+// real "may this cap authorize a mount" bit that does not exist yet —
+// it passes `vol_kind_narrow`'s own gate (`VK_OPS_VALID_MASK` = 0x3FF,
+// libpdx-volume's vol_kind.pdx) but carries no enforced meaning beyond
+// that gate, since `vol_kind_narrow`'s M2 body is itself a validate-
+// and-passthrough, not a real derivation (same file, same header).
+// Confirm the real op-catalog gap with osarch before any milestone
+// past M2 relies on this mask meaning anything semantically.
+//
+// ----------------------------------------------------------------------
+// libpdx-volume link status
+// ----------------------------------------------------------------------
+//
+// `vol_kind_narrow` is called here by bare symbol name, matching how
+// every intra-repo cross-file call in this tool already works (e.g.
+// main.pdx calling `argv_parse` / `mount_record_emit_dry_run` with no
+// qualification). libpdx-volume's own README (§"Declared but not yet
+// linked") lists `mount.pdxfs` as a planned-but-not-yet-linked consumer
+// of `vol_kind_mint` / `vol_kind_narrow` / `mount_table_snapshot` — this
+// file is that landing's first half. Neither this repo's
+// `tools/build.sh` (which compiles each `src/*.pdx` file to its own
+// standalone `.o`, with no link step at all — confirmed by reading that
+// script) nor any other script in this repo performs a cross-repo link
+// against libpdx-volume's build output. The actual link edge is
+// therefore still open; flagged for main alongside the sys_mount gap in
+// `src/mount_op.pdx`.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. Every byte load uses the
+// `xor reg, reg; mov_b reg, [ptr]` zero-extension idiom. No `test`
+// mnemonic; every zero-check is `cmp reg, 0`. No `imul`/`mul` — the
+// hex-accumulate step multiplies by 16 via `shl reg, 4` (a compile-time
+// shift, not a multiply instruction) rather than `imul reg, 16`.
+// Reserved-label discipline: every branch label in this file is
+// prefixed `mount_vc_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §4.1 (paideia-os);
+// libpdx-volume's src/vol_kind.pdx (vol_kind_narrow's real M2-004
+// body, called from step 2 below).
+
+module VolumeCap = structure {
+
+  // --- volume_cap_resolve status codes. ----------------------------------
+  pub let VC_OK               : u64 = 0
+  pub let VC_ERR_BAD_URI      : u64 = 1
+  pub let VC_ERR_NARROW_FAILED : u64 = 2
+
+  // --- volume_cap_parse_slot sentinel (no valid slot value collides with
+  //     all-ones; matches PMT_DECODE_BAD's precedent in
+  //     kind_pdxfs_mount_table.pdx for "the u64 that can never be a real
+  //     answer"). ---------------------------------------------------------
+  pub let VC_PARSE_ERR : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // --- URI prefix literal + length (NUL EXCLUDED from the length, as
+  //     every other literal-length pair in this repo does). -------------
+  pub let vc_lit_prefix : [u8; 14] = "cap:volume:0x\0"
+  pub let VC_PREFIX_LEN : u64 = 13
+
+  // --- ops_mask requested from vol_kind_narrow (see module header). ----
+  pub let VC_OPS_MOUNT_QUERY : u64 = 0x3
+
+  // ==========================================================================
+  // volume_cap_parse_slot(cap_uri_ptr) -> u64
+  //     (the decoded slot number, or VC_PARSE_ERR on any parse failure)
+  //
+  // rdi = cap_uri_ptr: a NUL-terminated <volume-cap> string, e.g.
+  // "cap:volume:0x0042". Matches the literal 13-byte prefix
+  // "cap:volume:0x" exactly (case-sensitive), then decodes every
+  // subsequent byte as one hex digit (`0`-`9`, `a`-`f`, `A`-`F`) until
+  // the terminating NUL. Refuses: a non-matching prefix, a NUL
+  // immediately after the prefix (zero hex digits), or any byte after
+  // the prefix that is not a hex digit and not NUL.
+  //
+  // Register plan (all SysV caller-save; leaf, no push/pop, no nested
+  // call):
+  //   rdi = cap_uri_ptr (held for the whole function)
+  //   r9  = byte cursor (starts at 0, walks the prefix then the hex tail)
+  //   r10 = &vc_lit_prefix (rip-relative, held across the prefix loop)
+  //   r11 = accumulator (hex value built up via shl 4 + or)
+  //   r8  = hex-digit count (0 at the end -> VC_ERR_BAD_URI)
+  //   rax, rcx = scratch (per-byte loads and digit classification)
+  // ==========================================================================
+  pub let volume_cap_parse_slot : (u64) -> u64 !{mem} @{} =
+    fn (cap_uri_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M2-001 (#4): volume_cap_parse_slot entry point. Pure leaf -- rax/rcx/rdi/r8/r9/r10/r11 are all SysV caller-save, no push/pop, no nested call. Phase 1 (mount_vc_prefix_loop): r9 walks 0..VC_PREFIX_LEN(13); each iteration loads cap_uri_ptr[r9] into rax and vc_lit_prefix[r9] into rcx via the xor+mov_b zero-extension idiom, `cmp rax,rcx; jne mount_vc_bad_uri` on any mismatch. Phase 2 (mount_vc_hex_loop, r9 continuing from 13): loads cap_uri_ptr[r9] into rax; rax==0 (NUL) -> mount_vc_hex_done. Digit classification via three cmp/jump bands: ['0'..'9'] (0x30..0x39) subtracts 0x30 directly; ['a'..'f'] (0x61..0x66) subtracts 0x61 then adds 10; ['A'..'F'] (0x41..0x46) subtracts 0x41 then adds 10; anything else (including any byte outside all three bands) falls to mount_vc_bad_uri. On a valid digit: `shl r11,4; or r11,rax` folds it into the accumulator (shl-by-immediate is a shift, not `imul`, honouring this repo's no-multiply-by-constant discipline), `add r8,1` (digit count), `add r9,1`, loop. mount_vc_hex_done: `cmp r8,0; je mount_vc_bad_uri` (zero digits after a matching prefix, e.g. bare \"cap:volume:0x\", is a refusal, not slot 0); else `mov rax,r11; ret`. mount_vc_bad_uri: `mov rax, 0xFFFFFFFFFFFFFFFF` (VC_PARSE_ERR, MOVABS-loaded per vol_kind_mint's own precedent for an all-ones sentinel -- outside the cmp-imm32 bound but legal for a register load, never compared against); ret. No `add reg,[mem]` anywhere (every add/sub/shl operates on registers or an immediate). No `test` mnemonic -- every check is `cmp reg,{0|imm}`. No `imul`/`mul`. Labels prefixed mount_vc_.",
+      block: {
+        xor r9, r9;                          // r9 = 0 (prefix cursor)
+        lea r10, [rip + vc_lit_prefix];      // r10 = &vc_lit_prefix
+
+      mount_vc_prefix_loop:
+        cmp r9, 13;                           // VC_PREFIX_LEN
+        jge mount_vc_prefix_ok;
+
+        xor rax, rax;
+        mov_b rax, [rdi + r9];
+        xor rcx, rcx;
+        mov_b rcx, [r10 + r9];
+        cmp rax, rcx;
+        jne mount_vc_bad_uri;
+
+        add r9, 1;
+        jmp mount_vc_prefix_loop;
+
+      mount_vc_prefix_ok:
+        xor r11, r11;                        // r11 = accumulator
+        xor r8, r8;                          // r8 = hex-digit count
+
+      mount_vc_hex_loop:
+        xor rax, rax;
+        mov_b rax, [rdi + r9];
+        cmp rax, 0;
+        je mount_vc_hex_done;
+
+        // ---- '0'..'9' (0x30..0x39) ------------------------------------
+        cmp rax, 0x30;
+        jl mount_vc_bad_uri;
+        cmp rax, 0x39;
+        jg mount_vc_check_lower;
+        sub rax, 0x30;
+        jmp mount_vc_hex_accumulate;
+
+      mount_vc_check_lower:
+        // ---- 'a'..'f' (0x61..0x66) --------------------------------------
+        cmp rax, 0x61;
+        jl mount_vc_check_upper;
+        cmp rax, 0x66;
+        jg mount_vc_bad_uri;
+        sub rax, 0x61;
+        add rax, 10;
+        jmp mount_vc_hex_accumulate;
+
+      mount_vc_check_upper:
+        // ---- 'A'..'F' (0x41..0x46) --------------------------------------
+        cmp rax, 0x41;
+        jl mount_vc_bad_uri;
+        cmp rax, 0x46;
+        jg mount_vc_bad_uri;
+        sub rax, 0x41;
+        add rax, 10;
+
+      mount_vc_hex_accumulate:
+        shl r11, 4;
+        or r11, rax;
+        add r8, 1;
+        add r9, 1;
+        jmp mount_vc_hex_loop;
+
+      mount_vc_hex_done:
+        cmp r8, 0;
+        je mount_vc_bad_uri;
+        mov rax, r11;
+        ret;
+
+      mount_vc_bad_uri:
+        mov rax, 0xFFFFFFFFFFFFFFFF;         // VC_PARSE_ERR
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // volume_cap_resolve(cap_uri_ptr, out_narrowed_slot_ptr) -> u64
+  //     (VC_OK | VC_ERR_BAD_URI | VC_ERR_NARROW_FAILED)
+  //
+  //   rdi = cap_uri_ptr          (NUL-terminated <volume-cap> string)
+  //   rsi = out_narrowed_slot_ptr (u64 write target; untouched on any
+  //                                 non-VC_OK return, matching
+  //                                 vol_kind_narrow's own "out_ptr
+  //                                 untouched on failure" discipline)
+  //
+  // Composes volume_cap_parse_slot (this file) with libpdx-volume's
+  // vol_kind_narrow (declared, not yet link-verified -- see module
+  // header). Register plan: rbx = cap_uri_ptr (survives the nested
+  // call to volume_cap_parse_slot), r12 = out_narrowed_slot_ptr
+  // (survives both nested calls) -- both SysV callee-save, pushed on
+  // entry and popped before the single `ret`.
+  // ==========================================================================
+  pub let volume_cap_resolve : (u64, u64) -> u64 !{mem} @{cap} =
+    fn (cap_uri_ptr: u64) (out_narrowed_slot_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "mount.pdxfs.M2-001 (#4): volume_cap_resolve entry point. SysV callee-save discipline: push rbx; push r12 (2 registers, 16 bytes) before repurposing either -- popped in reverse order before the single `ret`. rbx=cap_uri_ptr, r12=out_narrowed_slot_ptr, both now-saved callee-save registers surviving the two nested `call`s below (volume_cap_parse_slot and vol_kind_narrow each clobber only caller-save registers per their own justifications). Step 1: `mov rdi, rbx; call volume_cap_parse_slot` -> rax = slot or VC_PARSE_ERR (0xFFFFFFFFFFFFFFFF); `cmp rax, 0xFFFFFFFFFFFFFFFF; je mount_vc_resolve_bad_uri` (staged as a direct 64-bit immediate compare -- paideia-as accepts this shape for a MOVABS-class sentinel per vol_kind_narrow's own all-ones-immediate precedent). Step 2: `mov rdi, rax` (slot), `mov rsi, 0x3` (VC_OPS_MOUNT_QUERY -- see module header for why bits 0..1, not a real VOL_OP_MOUNT bit), `mov rdx, r12` (out_narrowed_slot_ptr), `call vol_kind_narrow` -> rax = LPV_VK_OK (0) | LPV_VK_ERR_BAD_OPS_MASK (1). `cmp rax, 0; jne mount_vc_resolve_narrow_failed` -> VC_ERR_NARROW_FAILED (2). Success: `xor rax, rax` (VC_OK). Effects `{mem}` covers vol_kind_narrow's own write to *out_narrowed_slot_ptr; capabilities `{cap}` reflects that a real (future) vol_kind_narrow derivation would consume the KIND_VOLUME cap system, kept even though M2's own body is a documented passthrough (mirrors sys_mount_body's own posture of keeping @{cap} ahead of the real backend landing). Labels prefixed mount_vc_resolve_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                        // rbx = cap_uri_ptr
+        mov r12, rsi;                        // r12 = out_narrowed_slot_ptr
+
+        // ---- Step 1: parse the URI into a raw slot number. ----------------
+        mov rdi, rbx;
+        call volume_cap_parse_slot;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;         // VC_PARSE_ERR sentinel
+        cmp rax, r10;
+        je mount_vc_resolve_bad_uri;
+
+        // ---- Step 2: narrow via libpdx-volume.vol_kind_narrow. -------------
+        mov rdi, rax;                        // cap_slot (raw, parsed)
+        mov rsi, 0x3;                        // VC_OPS_MOUNT_QUERY
+        mov rdx, r12;                        // out_narrowed_slot_ptr
+        call vol_kind_narrow;
+
+        cmp rax, 0;                          // LPV_VK_OK
+        jne mount_vc_resolve_narrow_failed;
+
+        xor rax, rax;                        // VC_OK
+        jmp mount_vc_resolve_done;
+
+      mount_vc_resolve_bad_uri:
+        mov rax, 1;                          // VC_ERR_BAD_URI
+        jmp mount_vc_resolve_done;
+
+      mount_vc_resolve_narrow_failed:
+        mov rax, 2;                          // VC_ERR_NARROW_FAILED
+
+      mount_vc_resolve_done:
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

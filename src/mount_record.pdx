@@ -75,6 +75,42 @@ module MountRecord = structure {
   pub let mr_lit_suffix     : [u8; 26] = ", result_code: DRY_RUN }\n\0"
   pub let mr_lit_suffix_len : u64 = 25
 
+  // --- mount.pdxfs.M2 (issues #4/#5/#6): result_code vocabulary for
+  //     `mount_record_emit_result` below. DRY_RUN is promoted from
+  //     M1's hardcoded suffix literal to an explicit code here so the
+  //     M2 emitter can select any of the four by value; OK,
+  //     ELEVATION_REQUIRED, and KERNEL_ERROR are new at M2. The full
+  //     §4.4 failure taxonomy (SIG_INVALID, ALREADY_MOUNTED, etc.) is
+  //     still M3-004 -- KERNEL_ERROR is this milestone's single
+  //     catch-all for "sys_mount (or the volume-cap resolve step ahead
+  //     of it) did not succeed", per src/mount_op.pdx's own header for
+  //     exactly why that syscall cannot succeed yet. -------------------
+  pub let MR_RESULT_DRY_RUN            : u64 = 0
+  pub let MR_RESULT_OK                 : u64 = 1
+  pub let MR_RESULT_ELEVATION_REQUIRED : u64 = 2
+  pub let MR_RESULT_KERNEL_ERROR       : u64 = 3
+
+  pub let mr_lit_result_code     : [u8; 16] = ", result_code: \0"
+  pub let mr_lit_result_code_len : u64 = 15
+
+  pub let mr_lit_result_dry_run     : [u8; 8] = "DRY_RUN\0"
+  pub let mr_lit_result_dry_run_len : u64 = 7
+
+  pub let mr_lit_result_ok     : [u8; 3] = "OK\0"
+  pub let mr_lit_result_ok_len : u64 = 2
+
+  pub let mr_lit_result_elevation     : [u8; 19] = "ELEVATION_REQUIRED\0"
+  pub let mr_lit_result_elevation_len : u64 = 18
+
+  pub let mr_lit_result_kernel_error     : [u8; 13] = "KERNEL_ERROR\0"
+  pub let mr_lit_result_kernel_error_len : u64 = 12
+
+  pub let mr_lit_mount_id     : [u8; 13] = ", mount_id: \0"
+  pub let mr_lit_mount_id_len : u64 = 12
+
+  pub let mr_lit_close     : [u8; 4] = " }\n\0"
+  pub let mr_lit_close_len : u64 = 3
+
   // ==========================================================================
   // mount_record_strlen(s) -> u64
   //
@@ -263,6 +299,252 @@ module MountRecord = structure {
         mov rax, 1;
         syscall;
 
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mount_record_print_decimal(value) -> ()
+  //
+  // Prints `value`'s decimal representation to fd 1 via sys_write.
+  // Factored out of mount_record_emit_dry_run's own inline segment-6
+  // (see that function's own comment history) so mount_record_emit_
+  // result below can print BOTH `flags` and `mount_id` without
+  // duplicating the div-by-10 loop a third time. Identical algorithm:
+  // a 24-byte stack scratch buffer, a zero special case, and a
+  // most-significant-last digit walk that needs no separate reversal
+  // pass.
+  //
+  // Pure leaf at the register level: every register touched (rax, rcx,
+  // rdx, rdi, rsi, r9, r10) is SysV caller-save, so this function needs
+  // no push/pop despite being called from the middle of another
+  // function's own register-heavy sequence -- the caller's callee-save
+  // registers (rbx/r12-r15 in mount_record_emit_result) are untouched.
+  // ==========================================================================
+  pub let mount_record_print_decimal : (u64) -> () !{mem, sysreg} @{fs} =
+    fn (value: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mount.pdxfs.M2 (#4/#5/#6): mount_record_print_decimal entry point, factored out of mount_record_emit_dry_run's own M1 segment-6 body verbatim (same algorithm, same register plan, now reusable for both `flags` and `mount_id`). value arrives in rdi. `sub rsp,24` scratch. Zero special case (`cmp rdi,0; jne mount_mr_pd_setup`): write a single '0' byte at [rsp], sys_write(1, rsp, 1), jmp done. General case: r9=remaining value (from rdi), r10=cursor at rsp+19 walking DOWN one byte per digit (MSB-last write order, so the final [cursor, rsp+20) slice is already MSB-first -- no reversal pass needed); div-by-10 loop (`mov rax,r9; mov rcx,10; xor rdx,rdx; div rcx; add rdx,0x30; mov [r10],dl; mov r9,rax; cmp r9,0; je emit; sub r10,1; jmp loop`); emit: digit count = (rsp+20) - r10, sys_write(1, r10, count). `add rsp,24` before the single `ret`. No `add reg,[mem]` (the digit-count computation is register-only). No `test` mnemonic. No `imul`/`mul` -- only `div` by the compile-time constant 10. Labels prefixed mount_mr_pd_.",
+      block: {
+        sub rsp, 24;
+
+        cmp rdi, 0;
+        jne mount_mr_pd_setup;
+
+        mov al, 0x30;
+        mov [rsp], al;
+        mov rdi, 1;
+        mov rsi, rsp;
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        jmp mount_mr_pd_done;
+
+      mount_mr_pd_setup:
+        mov r9, rdi;                         // r9 = remaining value
+        mov r10, rsp;
+        add r10, 19;                         // r10 = cursor at last staging byte
+
+      mount_mr_pd_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                        // zero-extend rdx:rax for div
+        div rcx;                             // rax = quotient, rdx = remainder
+        add rdx, 0x30;                       // digit -> ASCII '0'..'9'
+        mov [r10], dl;                       // store at cursor
+        mov r9, rax;                         // r9 = quotient
+        cmp r9, 0;
+        je mount_mr_pd_emit;
+        sub r10, 1;                          // advance cursor left (MSB-ward)
+        jmp mount_mr_pd_loop;
+
+      mount_mr_pd_emit:
+        mov rax, rsp;
+        add rax, 20;
+        sub rax, r10;                        // rax = digit count
+        mov rdx, rax;                        // sys_write count
+        mov rdi, 1;                          // fd
+        mov rsi, r10;                        // buf
+        mov rax, 1;                          // SC+ ID 1 = sys_write
+        syscall;
+
+      mount_mr_pd_done:
+        add rsp, 24;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mount_record_emit_result(volume_cap_ptr, mount_point_ptr, flags,
+  //                            result_code, mount_id) -> ()
+  //
+  //   rdi = volume_cap_ptr   (NUL-terminated <volume-cap> string)
+  //   rsi = mount_point_ptr  (NUL-terminated <mount-point> string)
+  //   rdx = flags            (ParsedArgv.flags, full u64 bitmask)
+  //   rcx = result_code      (MR_RESULT_DRY_RUN | MR_RESULT_OK |
+  //                           MR_RESULT_ELEVATION_REQUIRED |
+  //                           MR_RESULT_KERNEL_ERROR)
+  //   r8  = mount_id         (only printed when result_code ==
+  //                           MR_RESULT_OK; ignored otherwise)
+  //
+  // mount.pdxfs.M2's unified record emitter -- main.pdx's M2 pipeline
+  // calls this on every path (dry-run, elevation-required, kernel-error,
+  // and real success alike), unlike M1's mount_record_emit_dry_run
+  // (kept, unmodified, for its own M1 call shape) which only ever had
+  // one result_code to print. Segments, in wire order:
+  //   1. mr_lit_prefix                "PdxFsMountRecord@0.1 { volume: "
+  //   2. volume_cap_ptr, length via mount_record_strlen
+  //   3. mr_lit_mount_point           ", mount_point: "
+  //   4. mount_point_ptr, length via mount_record_strlen
+  //   5. mr_lit_flags                 ", flags: "
+  //   6. flags, decimal via mount_record_print_decimal
+  //   7. mr_lit_result_code           ", result_code: "
+  //   8. the result_code label string, selected by a cmp/je chain
+  //      against the four MR_RESULT_* values
+  //   9. IF result_code == MR_RESULT_OK only: mr_lit_mount_id
+  //      (", mount_id: ") + mount_id decimal via
+  //      mount_record_print_decimal
+  //   10. mr_lit_close                " }\n"
+  //
+  // Register plan. rbx/r12/r13/r14/r15 are SysV callee-save and are
+  // explicitly saved (push) on entry and restored (pop) before the
+  // single `ret` -- matches mount_record_emit_dry_run's own discipline:
+  //   rbx = volume_cap_ptr   (held across segment 2's nested call)
+  //   r12 = mount_point_ptr  (held across segment 4's nested call)
+  //   r13 = flags            (held across segments 1-5, consumed at
+  //                           segment 6's nested call)
+  //   r14 = result_code      (held across segments 1-7, consumed at
+  //                           segment 8's branch chain and segment 9's
+  //                           gate)
+  //   r15 = mount_id         (held across every segment; only read at
+  //                           segment 9)
+  // ==========================================================================
+  pub let mount_record_emit_result : (u64, u64, u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (volume_cap_ptr: u64) (mount_point_ptr: u64) (flags: u64) (result_code: u64) (mount_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mount.pdxfs.M2 (#4/#5/#6): mount_record_emit_result entry point. SysV callee-save discipline: push rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any of them -- popped in reverse order before the single `ret`. rbx=volume_cap_ptr, r12=mount_point_ptr, r13=flags, r14=result_code, r15=mount_id, all now-saved callee-save registers surviving the nested `call mount_record_strlen` / `call mount_record_print_decimal` invocations and every `syscall` (both callees clobber only caller-save registers per their own justifications; SYSCALL preserves callee-save registers per amd64 fast-syscall convention). Segments 1-6 are byte-for-byte the same shape as mount_record_emit_dry_run's own segments 1-6, with segment 6 now delegating to `call mount_record_print_decimal` (rdi=r13) instead of an inlined div loop. Segment 7: sys_write(1, mr_lit_result_code, 15). Segment 8: a cmp/je chain over r14 against 0/1/2/3 selects one of four (lit_ptr, lit_len) pairs (mr_lit_result_dry_run/7, mr_lit_result_ok/2, mr_lit_result_elevation/18, mr_lit_result_kernel_error/12 -- default/unrecognised code falls through to the KERNEL_ERROR literal as a defensive catch-all, never silently printing nothing) then one sys_write of the selected pair. Segment 9: `cmp r14, 1 (MR_RESULT_OK); jne mount_mr_er_close` gates the ENTIRE mount_id sub-segment -- on a match, sys_write(1, mr_lit_mount_id, 12) then `call mount_record_print_decimal` (rdi=r15). Segment 10 (mount_mr_er_close): sys_write(1, mr_lit_close, 3). Pops r15/r14/r13/r12/rbx (reverse push order) and returns. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mount_mr_er_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = volume_cap_ptr
+        mov r12, rsi;                       // r12 = mount_point_ptr
+        mov r13, rdx;                       // r13 = flags
+        mov r14, rcx;                       // r14 = result_code
+        mov r15, r8;                        // r15 = mount_id
+
+        // ---- Segment 1: "PdxFsMountRecord@0.1 { volume: " ----------------
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_prefix];
+        mov rdx, 31;                        // mr_lit_prefix_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        // ---- Segment 2: volume-cap string ---------------------------------
+        mov rdi, rbx;
+        call mount_record_strlen;
+        mov rdx, rax;                       // rdx = volume_cap_len
+        mov rdi, 1;
+        mov rsi, rbx;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 3: ", mount_point: " ---------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_mount_point];
+        mov rdx, 15;                        // mr_lit_mount_point_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 4: mount-point string ---------------------------------
+        mov rdi, r12;
+        call mount_record_strlen;
+        mov rdx, rax;                       // rdx = mount_point_len
+        mov rdi, 1;
+        mov rsi, r12;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 5: ", flags: " ----------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_flags];
+        mov rdx, 9;                         // mr_lit_flags_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 6: flags, decimal --------------------------------------
+        mov rdi, r13;
+        call mount_record_print_decimal;
+
+        // ---- Segment 7: ", result_code: " ------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_result_code];
+        mov rdx, 15;                        // mr_lit_result_code_len
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 8: the result_code label -------------------------------
+        cmp r14, 0;                         // MR_RESULT_DRY_RUN
+        je mount_mr_er_lit_dry_run;
+        cmp r14, 1;                         // MR_RESULT_OK
+        je mount_mr_er_lit_ok;
+        cmp r14, 2;                         // MR_RESULT_ELEVATION_REQUIRED
+        je mount_mr_er_lit_elevation;
+        jmp mount_mr_er_lit_kernel_error;   // MR_RESULT_KERNEL_ERROR or unrecognised
+
+      mount_mr_er_lit_dry_run:
+        lea rsi, [rip + mr_lit_result_dry_run];
+        mov rdx, 7;                         // mr_lit_result_dry_run_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_ok:
+        lea rsi, [rip + mr_lit_result_ok];
+        mov rdx, 2;                         // mr_lit_result_ok_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_elevation:
+        lea rsi, [rip + mr_lit_result_elevation];
+        mov rdx, 18;                        // mr_lit_result_elevation_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_kernel_error:
+        lea rsi, [rip + mr_lit_result_kernel_error];
+        mov rdx, 12;                        // mr_lit_result_kernel_error_len
+
+      mount_mr_er_lit_write:
+        mov rdi, 1;
+        mov rax, 1;
+        syscall;
+
+        // ---- Segment 9: mount_id (MR_RESULT_OK only) -------------------------
+        cmp r14, 1;                         // MR_RESULT_OK
+        jne mount_mr_er_close;
+
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_mount_id];
+        mov rdx, 12;                        // mr_lit_mount_id_len
+        mov rax, 1;
+        syscall;
+
+        mov rdi, r15;
+        call mount_record_print_decimal;
+
+      mount_mr_er_close:
+        // ---- Segment 10: " }\n" -------------------------------------------
+        mov rdi, 1;
+        lea rsi, [rip + mr_lit_close];
+        mov rdx, 3;                         // mr_lit_close_len
+        mov rax, 1;
+        syscall;
+
+        pop r15;
+        pop r14;
         pop r13;
         pop r12;
         pop rbx;
