@@ -1,0 +1,181 @@
+// tests/test_happy_mnt.pdx — mount.pdxfs.M4-001 (issue #11)
+// TestHappyMnt: happy-path smoke — a real (non-`--dry-run`) invocation
+// against a `/mnt` user-owned mount point, no elevate.
+//
+// ================================================================
+// What "invoke main dispatch" means for a driver, not a subprocess --
+// see tests/README.md for the full rationale
+// ================================================================
+//
+// This issue's own acceptance text asks to "invoke main dispatch with
+// `--dry-run false <cap:volume:0x42> /mnt/user`, assert result_code ==
+// OK (or KERNEL_ERROR if the kernel path is still stubbed)". `mount.
+// pdxfs`'s `_start` (src/main.pdx) is not a callable, return-value-
+// bearing function -- every path through it ends in a real `sys_exit`.
+// This driver instead builds the exact argv array a real invocation
+// with those arguments would receive, feeds it through `Argv::argv_
+// parse`, then walks the SAME sequence of real entry points `_start`
+// calls (`Elevate::mount_point_class`, `VolumeCap::volume_cap_resolve`,
+// `MountOp::mount_op_invoke`, `MountRecord::mount_record_classify_
+// mount_errno`), asserting on each real return value in turn.
+//
+// One deliberate precision improvement over this issue's own "or
+// KERNEL_ERROR" allowance: M3-004 (#10) gave the ENOSYS case its OWN
+// distinct `MR_RESULT_ENOSYS` code rather than folding it into the
+// generic `MR_RESULT_KERNEL_ERROR` -- since `dispatch_mount` is a still-
+// unconditional `-ENOSYS` stub (src/mount_op.pdx's own KERNEL GAP #1),
+// ENOSYS is the actual, deterministic outcome this driver observes
+// today, not merely "some kernel error or other". This driver therefore
+// accepts either `MOUNT_OP_OK` (the real success path, kept for the day
+// dispatch_mount is wired) or `MOUNT_OP_ERR_KERNEL` classifying to
+// `MR_RESULT_ENOSYS` specifically -- a strictly narrower, more honest
+// assertion than a bare "or KERNEL_ERROR".
+//
+// ================================================================
+// The synthetic argv fixture
+// ================================================================
+//
+// `thm_argv_str0/1/2` hold three NUL-terminated strings ("mount.pdxfs",
+// "cap:volume:0x42", "/mnt/user") in `.bss`; `thm_argv_vec` holds their
+// three addresses as a `char*[3]` a real execve would hand `_start` in
+// `rsi`. No `--dry-run` flag is present among argv[1..3) -- this is a
+// REAL (non-dry-run) invocation, matching the issue's own "false".
+//
+// ================================================================
+// Return-code convention (matches tests/README.md)
+// ================================================================
+//
+//   0   -- every assertion passed.
+//   1   -- Argv::argv_parse did not return ARGV_OK.
+//   2   -- Elevate::mount_point_class did not return MPC_USER_SUBTREE
+//          for "/mnt/user" (would indicate a classifier regression).
+//   3   -- VolumeCap::volume_cap_resolve did not return VC_OK for
+//          "cap:volume:0x42" (a well-formed hex slot).
+//   4   -- MountOp::mount_op_invoke returned neither MOUNT_OP_OK nor a
+//          MOUNT_OP_ERR_KERNEL that classifies to MR_RESULT_ENOSYS.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; every check is `cmp`.
+//   - Cross-module calls (`argv_parse`, `mount_point_class`,
+//     `volume_cap_resolve`, `mount_op_invoke`, `mount_record_classify_
+//     mount_errno`) use the bare unqualified symbol name, per this
+//     repo's established convention (main.pdx's own cross-file calls)
+//     -- `tools/build.sh` compiles this file standalone with no link
+//     step, so these are unresolved-external references in this file's
+//     own `.o`, resolved only once a future consumer links `src/`
+//     alongside this driver.
+//   - Register plan: r12 holds argv_out's field values loaded once and
+//     re-derived from `.bss` as needed (no value needs to survive past
+//     a single nested call chain without being reloaded); r13 holds the
+//     narrowed volume-cap slot across the mount_op_invoke call. No
+//     callee-save push/pop is needed since nothing here must survive
+//     across a call it does not immediately consume.
+//   - Label prefix `mount_test_` (this repo's reserved-label discipline
+//     for the tests/ directory).
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.3 (mount.pdxfs#11);
+// tests/README.md (this repo, return-code convention + why these are
+// pipeline-replay drivers).
+
+module TestHappyMnt = structure {
+
+  pub let mut thm_argv_str0 : [u8; 12] = "mount.pdxfs\0"
+  pub let mut thm_argv_str1 : [u8; 16] = "cap:volume:0x42\0"
+  pub let mut thm_argv_str2 : [u8; 10] = "/mnt/user\0"
+
+  pub let mut thm_argv_vec : [u8; 24] = uninit @align(8)   // char*[3]
+  pub let mut thm_parsed   : [u8; 24] = uninit @align(8)   // ParsedArgv
+  pub let mut thm_narrowed : u64      = uninit @align(8)
+  pub let mut thm_mount_id : u64      = uninit @align(8)
+  pub let mut thm_raw_errno : u64     = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M4-001 (#11): TestHappyMnt::run entry point. Populates thm_argv_vec[0..3) with &thm_argv_str0/1/2 (three plain `lea rax,[rip+sym]; mov [r11+8*i],rax` stores). Calls argv_parse(argc=3, argv=&thm_argv_vec, out=&thm_parsed); `cmp rax,0; jne mount_test_thm_fail_argv` (return 1). Loads flags=[thm_parsed+0] (expected 0, no --dry-run token present), volume_cap_ptr=[thm_parsed+8], mount_point_ptr=[thm_parsed+16]. Calls mount_point_class(mount_point_ptr); `cmp rax,0; jne mount_test_thm_fail_class` (MPC_USER_SUBTREE expected, return 2). Calls volume_cap_resolve(volume_cap_ptr, &thm_narrowed); `cmp rax,0; jne mount_test_thm_fail_resolve` (VC_OK expected, return 3). Calls mount_op_invoke([thm_narrowed], mount_point_ptr, flags=0, &thm_mount_id, &thm_raw_errno); `cmp rax,0; je mount_test_thm_pass` (MOUNT_OP_OK, the real-success arm, accepted outright). Otherwise (MOUNT_OP_ERR_KERNEL): `cmp rax,1; jne mount_test_thm_fail_op` (defensive -- mount_op_invoke's own contract only has two return values, but an unrecognised third is still a failure here, return 4); loads raw_errno=[thm_raw_errno], calls mount_record_classify_mount_errno(raw_errno); `cmp rax,14; jne mount_test_thm_fail_op` (MR_RESULT_ENOSYS expected -- the one real outcome dispatch_mount's still-unwired stub actually produces today, per src/mount_op.pdx's own KERNEL GAP #1 -- any OTHER classification is a genuine regression, return 4). mount_test_thm_pass: return 0. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mount_test_thm_.",
+      block: {
+        // ---- Build the synthetic argv vector. ------------------------------
+        lea r11, [rip + thm_argv_vec];
+        lea rax, [rip + thm_argv_str0];
+        mov [r11 + 0], rax;
+        lea rax, [rip + thm_argv_str1];
+        mov [r11 + 8], rax;
+        lea rax, [rip + thm_argv_str2];
+        mov [r11 + 16], rax;
+
+        // ---- Parse it. ------------------------------------------------------
+        mov rdi, 3;
+        lea rsi, [rip + thm_argv_vec];
+        lea rdx, [rip + thm_parsed];
+        call argv_parse;
+
+        cmp rax, 0;                          // ARGV_OK
+        jne mount_test_thm_fail_argv;
+
+        // ---- Elevate classification. ----------------------------------------
+        lea r11, [rip + thm_parsed];
+        mov r12, [r11 + 16];                 // r12 = mount_point_ptr
+
+        mov rdi, r12;
+        call mount_point_class;
+        cmp rax, 0;                          // MPC_USER_SUBTREE
+        jne mount_test_thm_fail_class;
+
+        // ---- Volume-cap resolve. ----------------------------------------
+        lea r11, [rip + thm_parsed];
+        mov r13, [r11 + 8];                  // r13 = volume_cap_ptr
+
+        mov rdi, r13;
+        lea rsi, [rip + thm_narrowed];
+        call volume_cap_resolve;
+        cmp rax, 0;                          // VC_OK
+        jne mount_test_thm_fail_resolve;
+
+        // ---- mount_op_invoke (real, non-dry-run: flags = 0). -----------------
+        mov rdi, [rip + thm_narrowed];
+        mov rsi, r12;                        // mount_point_ptr
+        xor rdx, rdx;                        // flags = 0 (no --dry-run)
+        lea rcx, [rip + thm_mount_id];
+        lea r8, [rip + thm_raw_errno];
+        call mount_op_invoke;
+
+        cmp rax, 0;                          // MOUNT_OP_OK
+        je mount_test_thm_pass;
+
+        cmp rax, 1;                          // MOUNT_OP_ERR_KERNEL
+        jne mount_test_thm_fail_op;
+
+        mov rdi, [rip + thm_raw_errno];
+        call mount_record_classify_mount_errno;
+        cmp rax, 14;                         // MR_RESULT_ENOSYS
+        jne mount_test_thm_fail_op;
+
+      mount_test_thm_pass:
+        xor rax, rax;
+        ret;
+
+      mount_test_thm_fail_argv:
+        mov rax, 1;
+        ret;
+
+      mount_test_thm_fail_class:
+        mov rax, 2;
+        ret;
+
+      mount_test_thm_fail_resolve:
+        mov rax, 3;
+        ret;
+
+      mount_test_thm_fail_op:
+        mov rax, 4;
+        ret;
+      }
+    }
+}

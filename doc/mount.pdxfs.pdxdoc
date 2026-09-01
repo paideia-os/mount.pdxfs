@@ -1,0 +1,193 @@
+%%% pdxdoc-source v0.1
+%%% This is the source form of the .pdxdoc file that `doc mount.pdxfs`
+%%% renders. Format hardening lands with doc.M1-002 (paideia-os plan
+%%% §5.3); the M5-001 source lives in the repo under version control
+%%% and the release tool ships the compiled `.pdxdoc` alongside the
+%%% binary into /pkgs/mount.pdxfs-1.0.0/doc/mount.pdxfs.pdxdoc.
+%%%
+%%% Section markers: a bare `==== <title>` line opens a section. Cross-
+%%% references use `[[cref: <target>]]` where <target> is either a
+%%% doc-local section title or a `<tool>#<section>` fully-qualified
+%%% reference the reader resolves against /system/doc/. POSIX-difference
+%%% annotations use a `[[posix: <difference>]]` inline tag.
+
+==== NAME
+mount.pdxfs — attach a `KIND_VOLUME` capability to a VFS mount point,
+with audit-first `PdxFsMountRecord@0.1` journaling and elevate-gated
+writes to protected trees.
+
+==== SYNOPSIS
+    mount.pdxfs [--ro] [--noexec] [--verbose] [--dry-run] <volume-cap> <mount-point>
+
+`<volume-cap>` is a `KIND_VOLUME` cap URI (`cap:volume:0xNN`, hex slot
+number) looked up in the invoker's cap environment. `<mount-point>` is
+the VFS path the volume should attach at.
+
+==== DESCRIPTION
+`mount.pdxfs` is the second of three actions that bring a blank disk
+(or image file) online for PdxFS v1: format (`mkfs.pdxfs`), then
+**mount** (this tool), with `umount.pdxfs` as the reversal. It is a
+standalone ring-3 ELF — not a library — that issues its own syscalls
+directly, matching every other `src/user/*.pdx` tool in the paideia-os
+monorepo.
+
+Every invocation follows the same six-phase pipeline: parse argv, open
+one shared `libpdx-audit` INTENT record, classify `<mount-point>`'s
+§4.2 mount-point class, resolve + narrow `<volume-cap>` via
+`libpdx-volume`, attempt `sys_mount` (or skip it under `--dry-run`), and
+emit exactly one `PdxFsMountRecord@0.1` line plus the matching audit
+RESULT record before exiting. See [[cref: MOUNT-POINT-CLASSES]] for the
+four-class table, [[cref: RESULT-CODES]] for the full failure taxonomy,
+and [[cref: LIMITATIONS]] for what is stubbed or deferred at v1.0.0.
+
+==== OPTIONS
+---- --ro
+Mount read-only. Sets bit 0 of the internal flags bitmask.
+
+---- --noexec
+Disallow execution of files on the mounted volume. Sets bit 1.
+
+---- --verbose
+Reserved for future diagnostic output. Sets bit 2; no behavior change
+at v1.0.0.
+
+---- --dry-run
+Skip the real `sys_mount` syscall entirely. Every other pipeline phase
+(argv parse, audit INTENT/RESULT, mount-point classification,
+volume-cap resolve) still runs for real; only the syscall itself is
+skipped. Sets bit 3. `result_code: DRY_RUN` is printed unconditionally
+on this path, regardless of what a real attempt would have produced.
+
+==== MOUNT-POINT-CLASSES
+Four buckets (§4.2 of `design/tooling/volume-tooling-ux.md`, paideia-os
+— this tool's own scope is narrower than that design doc's full
+five-class table; see [[cref: LIMITATIONS]]):
+
+    MPC_USER_SUBTREE (0)  -- /home/**, /mnt/**, /tmp/**. No elevate.
+    MPC_SYSTEM_PATH  (1)  -- /system/**, /boot/**, /dev/**. Elevate
+                             required -- see [[cref: ELEVATE]].
+    MPC_CROSS_USER   (2)  -- another user's /home/** subtree. Defined
+                             but NEVER PRODUCED at v1.0.0 -- no
+                             KIND_USER identity lookup exists to tell
+                             an own-subtree path apart from another
+                             user's; every /home/** path classifies as
+                             MPC_USER_SUBTREE today.
+    MPC_INVALID      (3)  -- anything matching none of the six known
+                             prefixes above. result_code: INVALID_
+                             MOUNT_POINT, exit 3.
+
+==== ELEVATE
+`MPC_SYSTEM_PATH` (and, once reachable, `MPC_CROSS_USER`) trigger a
+call into `libpdx-elevate`'s `elevate_client_acquire` flow -- but this
+tool holds no `KIND_ELEVATE_CHANNEL` broker-endpoint capability
+(`caps.decl`'s own note: still a PLACEHOLDER at v1.0.0), so the call
+site is a documented FAIL-CLOSED STUB: it always denies. Every elevate-
+required mount point therefore produces `result_code: ELEVATION_STUB`
+and a non-zero exit (4) -- NOT `ELEVATION_REQUIRED` (an older, distinct
+code from a prior milestone meaning "this tool refuses to even try");
+`ELEVATION_STUB` means "this tool classified the mount point correctly
+and knows elevation is genuinely needed, but the broker hop itself is
+unprovisioned." See [[cref: LIMITATIONS]].
+
+==== RESULT-CODES
+Every invocation prints exactly one
+`PdxFsMountRecord@0.1 { volume: ..., mount_point: ..., flags: ...,
+result_code: <CODE> [, mount_id: <id>] }` line (preceded by a
+semantic-pipe deferral header -- see [[cref: LIMITATIONS]]). The full
+`result_code` vocabulary, by numeric value:
+
+    0  DRY_RUN               -- --dry-run given; no syscall issued.
+    1  OK                    -- real success. mount_id is printed.
+                                 Unreachable at v1.0.0 (dispatch_mount
+                                 is kernel-side unwired).
+    2  ELEVATION_REQUIRED    -- reserved; no code path in this repo
+                                 emits this any more (superseded by
+                                 ELEVATION_STUB below).
+    3  KERNEL_ERROR          -- generic fallback for any kernel errno
+                                 not covered by a more specific code.
+    4  ELEVATION_STUB        -- mount point needs elevate; the
+                                 fail-closed libpdx-elevate stub denied.
+    5  INVALID_MOUNT_POINT   -- mount point matched none of the six
+                                 known §4.2 prefixes.
+    6  BAD_VOLUME_CAP        -- <volume-cap> failed to parse as
+                                 `cap:volume:0xNN`.
+    7  NARROW_FAILED         -- libpdx-volume.vol_kind_narrow refused
+                                 the requested ops_mask.
+    8  EINVAL_BACKEND        -- sys_mount: SYS_MOUNT_EINVAL_BACKEND.
+    9  EINVAL_MP_LEN         -- sys_mount: SYS_MOUNT_EINVAL_MP_LEN.
+    10 EINVAL_DEV_LEN        -- sys_mount: SYS_MOUNT_EINVAL_DEV_LEN.
+    11 UNIMPL_BACKEND        -- sys_mount: SYS_MOUNT_UNIMPL_PDXFS_BLOCK.
+    12 MOUNT_FAIL            -- sys_mount: SYS_MOUNT_MOUNT_FAIL.
+    13 EFAULT                -- sys_mount: SYS_MOUNT_EFAULT.
+    14 ENOSYS                -- raw -ENOSYS. THE ONE REAL, OBSERVED
+                                 OUTCOME at v1.0.0 for any well-formed
+                                 non-dry-run, non-elevate-gated
+                                 invocation -- dispatch_mount is still
+                                 an unconditional -ENOSYS stub
+                                 kernel-side.
+    15 AUDIT_FAIL            -- reserved for a future stricter
+                                 audit-gated-output mode; never emitted
+                                 by any v1.0.0 call site.
+
+Exit codes: 0 (DRY_RUN/OK), 2 (missing positional argv), 3 (any
+kernel-error-family code: 3, 5, 6, 7, 8..15), 4 (ELEVATION_STUB or the
+now-unreachable ELEVATION_REQUIRED).
+
+==== AUDIT
+Every invocation opens exactly one `libpdx-audit` record before any
+dispatch (`op_name` = `"mount.pdxfs.mount"` or
+`"mount.pdxfs.mount.dry_run"`, `op_args` = the real `<mount-point>`
+string) and commits it on every terminal path with the real process
+exit status -- one shared `audit_id` links the INTENT event (open) and
+the RESULT event (commit). The kernel-side audit-journal broker
+dispatch is confirmed stubbed as of v1.0.0 (`libpdx-audit`'s own
+STATUS.md), so every audit call may no-op at the daemon; this tool
+treats that as an expected, non-fatal outcome (a zero `audit_id` from
+`audit_begin` is threaded through unexamined, and `audit_commit` is
+simply skipped for it).
+
+==== LIMITATIONS
+Cited from `design/architecture.md` / `STATUS.md`; each item names the
+milestone with the full rationale.
+
+- **No real end-to-end mount.** `sys_mount` (sysno 75) is
+  dispatch-unwired kernel-side (`dispatch_mount` is an unconditional
+  `-ENOSYS` stub); even once wired, its real ABI does not accept a
+  `KIND_VOLUME` cap slot, contradicting the cap-slot contract this
+  tool's own call shape targets (M2-002, M3-004).
+- **`KIND_PDXFS_MOUNT_TABLE` row append is a best-effort no-op.**
+  `PMT_OP_APPEND_ROW` is reserved but refused kernel-side; this tool's
+  own call site discards the result (M2-002).
+- **`libpdx-elevate` is never actually dispatched.** No
+  `KIND_ELEVATE_CHANNEL` broker-endpoint cap is provisioned for this
+  tool; `mount_elev_require_system` always denies (M3-001).
+- **No cross-user `/home/**` distinction.** `MPC_CROSS_USER` is a
+  defined but unreachable classification; no `KIND_USER` identity
+  lookup exists in this tool (M2-003, unchanged at M3-001).
+- **No `libpdx-semantic-pipe` binding.** `Registry::bind_by_name` is
+  confirmed inert (`paideia-os#2000`); every record is the line-based
+  fallback rendering, preceded by a documented deferral header
+  (M3-003).
+- **No independent `KIND_VOLUME` kind check.** No `cap_check_kind`-
+  style kernel primitive exists anywhere in the tree; a cap slot of the
+  wrong kind narrows "successfully" today and only fails once (a real)
+  `sys_mount` itself would reject it (M2-001).
+- **The dual-signed release manifest is not actually signed at
+  v1.0.0.** `release/manifest.pdxsig.txt` ships with every hash and
+  signature slot as a documented placeholder (M5-001).
+
+==== SEE-ALSO
+Upstream design: `design/tooling/volume-tooling-ux.md` §4 + §9.3 and
+`design/tooling/volume-lifecycle-mechanism.md` in the paideia-os repo.
+Repo-internal shape: `design/architecture.md` in this repo. Per-driver
+test contracts: `tests/README.md`. Release workflow:
+`release/RELEASE-1.0.0.md`. Sibling tools: `mkfs.pdxfs` (format),
+`umount.pdxfs` (reversal, not yet a repo). Shared library:
+`libpdx-volume`.
+
+==== VERSION
+mount.pdxfs 1.0.0 (R53 wave, M5-001/M5-002 signed-release scaffold). The
+actual dual-sign + mirror-push run happens once substrates S1
+(paideia-as toolchain), S2 (pkgs.paideia-os endpoint), and S5
+(a real `KIND_ELEVATE_CHANNEL` broker cap for this tool) go green, per
+`release/RELEASE-1.0.0.md` §3.

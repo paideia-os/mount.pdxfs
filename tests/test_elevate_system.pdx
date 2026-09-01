@@ -1,0 +1,117 @@
+// tests/test_elevate_system.pdx — mount.pdxfs.M4-002 (issue #12)
+// TestElevateSystem: elevate-required smoke — a `/system/foo` mount
+// point, asserting the M3-001 (#7) fail-closed elevate posture.
+//
+// ================================================================
+// What this asserts, and why ELEVATION_STUB rather than ELEVATION_
+// REQUIRED
+// ================================================================
+//
+// This issue's own acceptance text asks to "invoke with `/system/foo`,
+// assert `result_code == ELEVATION_REQUIRED` (or ELEVATION_STUB per the
+// fail-closed posture)". `src/elevate.pdx`'s M3-001 landing is exactly
+// that fail-closed posture: `Elevate::mount_point_class` classifies
+// `/system/foo` as `MPC_SYSTEM_PATH`, and `Elevate::mount_elev_require_
+// system` ALWAYS returns `MOUNT_ELEV_DENY` (no libpdx-elevate broker cap
+// provisioned -- see that file's own module header for the full
+// write-up). `main.pdx`'s own dispatch maps this outcome to `result_
+// code: MR_RESULT_ELEVATION_STUB` (4), a DISTINCT code from M2's own
+// `MR_RESULT_ELEVATION_REQUIRED` (2) -- this driver therefore asserts
+// the STUB code specifically, since that is the one this landing's real,
+// wired pipeline actually produces for this input; asserting the older
+// `ELEVATION_REQUIRED` code here would be asserting a value no code path
+// in this repo can reach for a `/system/**` target any more.
+//
+// ================================================================
+// Return-code convention (matches tests/README.md)
+// ================================================================
+//
+//   0   -- every assertion passed.
+//   1   -- Argv::argv_parse did not return ARGV_OK.
+//   2   -- Elevate::mount_point_class did not return MPC_SYSTEM_PATH
+//          for "/system/foo".
+//   3   -- Elevate::mount_elev_require_system did not return MOUNT_
+//          ELEV_DENY (the only value reachable at this landing).
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; every check is `cmp`.
+//   - Cross-module calls (`argv_parse`, `mount_point_class`,
+//     `mount_elev_require_system`) use the bare unqualified symbol
+//     name, per this repo's established convention -- unresolved-
+//     external references in this file's own `.o`, same as every other
+//     driver in this directory.
+//   - Label prefix `mount_test_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.3 (mount.pdxfs#12);
+// src/elevate.pdx (this repo, M3-001, #7 -- the fail-closed posture
+// this driver asserts); tests/README.md (return-code convention).
+
+module TestElevateSystem = structure {
+
+  pub let mut tes_argv_str0 : [u8; 12] = "mount.pdxfs\0"
+  pub let mut tes_argv_str1 : [u8; 15] = "cap:volume:0x1\0"
+  pub let mut tes_argv_str2 : [u8; 12] = "/system/foo\0"
+
+  pub let mut tes_argv_vec : [u8; 24] = uninit @align(8)   // char*[3]
+  pub let mut tes_parsed   : [u8; 24] = uninit @align(8)   // ParsedArgv
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M4-002 (#12): TestElevateSystem::run entry point. Populates tes_argv_vec[0..3) with &tes_argv_str0/1/2. Calls argv_parse(argc=3, argv=&tes_argv_vec, out=&tes_parsed); `cmp rax,0; jne mount_test_tes_fail_argv` (return 1). Loads mount_point_ptr=[tes_parsed+16]. Calls mount_point_class(mount_point_ptr); `cmp rax,1; jne mount_test_tes_fail_class` (MPC_SYSTEM_PATH expected, return 2). Calls mount_elev_require_system(mount_point_ptr, mpc_class=1); `cmp rax,0; jne mount_test_tes_fail_deny` (MOUNT_ELEV_DENY expected -- the only value reachable at this landing, return 3). Falls through to return 0. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mount_test_tes_.",
+      block: {
+        // ---- Build the synthetic argv vector. ------------------------------
+        lea r11, [rip + tes_argv_vec];
+        lea rax, [rip + tes_argv_str0];
+        mov [r11 + 0], rax;
+        lea rax, [rip + tes_argv_str1];
+        mov [r11 + 8], rax;
+        lea rax, [rip + tes_argv_str2];
+        mov [r11 + 16], rax;
+
+        mov rdi, 3;
+        lea rsi, [rip + tes_argv_vec];
+        lea rdx, [rip + tes_parsed];
+        call argv_parse;
+
+        cmp rax, 0;                          // ARGV_OK
+        jne mount_test_tes_fail_argv;
+
+        lea r11, [rip + tes_parsed];
+        mov r12, [r11 + 16];                 // r12 = mount_point_ptr
+
+        mov rdi, r12;
+        call mount_point_class;
+        cmp rax, 1;                          // MPC_SYSTEM_PATH
+        jne mount_test_tes_fail_class;
+
+        mov rdi, r12;
+        mov rsi, 1;                          // MPC_SYSTEM_PATH
+        call mount_elev_require_system;
+        cmp rax, 0;                          // MOUNT_ELEV_DENY
+        jne mount_test_tes_fail_deny;
+
+        xor rax, rax;
+        ret;
+
+      mount_test_tes_fail_argv:
+        mov rax, 1;
+        ret;
+
+      mount_test_tes_fail_class:
+        mov rax, 2;
+        ret;
+
+      mount_test_tes_fail_deny:
+        mov rax, 3;
+        ret;
+      }
+    }
+}

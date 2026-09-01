@@ -51,15 +51,21 @@
 #        M1 never calls sys_mount and so never has a row to append.
 #
 #   KIND_ELEVATE_CHANNEL    = 0x191  (src/kernel/core/cap/kind_elevate_channel.pdx)
-#     -- consumed at mount.pdxfs.M3-001 when <mount-point> falls under
-#        one of the always-elevate classes (`/system/**`, `/boot/**`,
-#        `/dev/**`, per §4.2's mount-point-class table) or the
-#        founder-only-elevate default (any other class not covered by
-#        the never-elevate rows). Not referenced by any M1 code path --
-#        src/elevate.pdx is a scaffold placeholder at M1 (see that
-#        file's module header); its `elevate_needed` stub always
-#        returns "not required" since M1's dry-run print never inspects
-#        <mount-point>'s class and never calls sys_mount either way.
+#     -- STILL a PLACEHOLDER as of the M3-001 (#7) landing. §4.2's
+#        mount-point-class table (`/system/**`, `/boot/**`, `/dev/**` --
+#        always elevate; cross-user `/home/**` -- founder-only elevate)
+#        is now REALLY classified by src/elevate.pdx's `mount_point_
+#        class`, and `mount_elev_require_system` is a real, wired call
+#        SITE for libpdx-elevate's `elevate_client_acquire` -- but no
+#        code path in ANY landing of this repo has ever bound a real
+#        KIND_ELEVATE_CHANNEL broker-endpoint cap (the `parent_ep_slot`
+#        libpdx-elevate's own README says is "declared by whatever the
+#        caller links this library into, not by libpdx-elevate" itself),
+#        so `mount_elev_require_system`'s body is a documented
+#        fail-closed STUB returning MOUNT_ELEV_DENY unconditionally --
+#        see that file's own module header for the full write-up,
+#        mirroring mkfs.pdxfs's own src/elevate_wire.pdx (M3-005, #12)
+#        over the identical library and the identical gap.
 #
 #   KIND_IPC_ENDPOINT       = 5 (base kind, R20b) -- the semantic-pipe
 #     stdin/stdout surface. Per design/tooling/r49-r50-plan.md §3.2, a
@@ -83,6 +89,62 @@
 # (BLAKE3-truncated fingerprint constant, semantic-pipe framing) is
 # owned by mount.pdxfs.M3-003 per volume-tooling-ux.md §7.4, not this
 # issue.
+#
+# M3 landing status (see STATUS.md, design/architecture.md §11): three
+# new satellite-library links, one KIND-shape confirmation (libpdx-
+# elevate's, above), no new syscalls of this repo's own.
+#
+# consumed_satellite_libs (all cross-repo bare-label `call`s, the same
+# mechanism M2's `vol_kind_narrow` call already uses -- see src/
+# volume_cap.pdx's own "libpdx-volume link status" note):
+#
+#   libpdx-audit (@0.2, commit bfc63a5) -- `AuditClient::audit_begin`,
+#     `AuditClient::audit_commit` (src/audit_wire.pdx, #8). REAL calls
+#     (real IPC send attempts, sharing one audit_id between the INTENT
+#     event at audit_begin and the RESULT event at audit_commit), but
+#     the daemon-side dispatch is confirmed STUBBED (libpdx-audit's own
+#     STATUS.md: `audit_journal_broker_dispatch` returns `AJB_DISPATCH_
+#     STUB`) -- every call in this landing may therefore no-op at the
+#     daemon, per this issue's own forgiving-posture instruction. No
+#     `parent_audit_id` parameter exists on `audit_commit` -- see
+#     src/audit_wire.pdx's own module header for how this issue's own
+#     "parent_audit_id" wording maps onto the real API's shared-audit_id
+#     mechanism instead.
+#
+#   libpdx-elevate (v1.1.0-in-progress, mature) -- NOT actually called
+#     for a real elevation decision (src/elevate.pdx's `mount_elev_
+#     require_system`, #7): this library's real API (`elevate_client_
+#     acquire`/`elevate_client_require`) needs a `parent_ep_slot`
+#     broker-endpoint cap this repo does not hold (KIND_ELEVATE_CHANNEL
+#     = 0x191, still the M1 placeholder, unchanged by this landing).
+#     `mount_elev_require_system` is therefore a fail-closed stub
+#     returning DENY unconditionally -- see that file's own module
+#     header for the full mismatch between this issue's assumed API
+#     shape and libpdx-elevate's real one (identical gap, identical
+#     library, as mkfs.pdxfs's own src/elevate_wire.pdx, M3-005 #12).
+#
+#   libpdx-semantic-pipe (v1.0.0, real + released) -- NOT linked
+#     (src/pipe_wire.pdx, #9): confirmed via GitHub issue paideia-os#2000
+#     that `Registry::bind_by_name` is inert (the backing `svc.schema-
+#     registry` service does not exist yet, so `bind_by_name` always
+#     returns 304/LOOKUP_FAIL). Per this issue's own fallback
+#     instruction, every PdxFsMountRecord@0.1 this repo emits remains
+#     the M1/M2 line-based `sys_write(1, ...)` rendering, now preceded
+#     by one documented deferral header line.
+#
+# M3-004 (#10) failure-taxonomy note: `src/mount_record.pdx`'s eleven
+# new `MR_RESULT_*` codes map every kernel errno `sys_mount` (sysno 75)
+# can return -- per `grep -n "pub let SYS_MOUNT_" src/kernel/core/
+# syscall/sys_mount.pdx` (paideia-os) -- plus raw `-ENOSYS` (the value
+# `dispatch_mount`'s still-unwired stub actually returns today) and four
+# policy refusals this repo's own pipeline detects before ever reaching
+# a syscall (`MPC_INVALID`, `VC_ERR_BAD_URI`, `VC_ERR_NARROW_FAILED`,
+# and the M3-001 elevate-stub outcome itself). None of the six real
+# `SYS_MOUNT_*` sentinels are reachable in practice today -- `dispatch_
+# mount` (`src/kernel/core/syscall/dispatch.pdx` L1975) is still an
+# unconditional `-ENOSYS` stub per `src/mount_op.pdx`'s own KERNEL GAP
+# #1 -- but their classification arms are real, wired code kept ready
+# for the day that gap closes.
 #
 # No KIND naming gap between this repo's four consumed kinds and the
 # kernel tree as of this landing -- unlike mkfs.pdxfs's KIND_BLOCK_DEVICE

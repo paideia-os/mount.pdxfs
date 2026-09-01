@@ -1,0 +1,153 @@
+# mount.pdxfs v1.0.0 — release manifest (source form)
+#
+# This is the human-readable source form of `manifest.pdxsig`. The
+# release tool at pkgs.paideia-os mirror-push time (a) enumerates the
+# artifact list below, (b) recomputes every BLAKE3-256 hash from the
+# repo tree at the v1.0.0 tag, (c) writes the completed manifest into
+# a binary `manifest.pdxsig`, and (d) invokes
+#   paideia-pq-sign::sign_release_artifact(sk, manifest_path)
+# once with the paideia-release-line Ed25519 secret key and once with
+# the ML-DSA-65 secret key. The two detached signatures are appended
+# to the manifest in the fixed layout below and the resulting
+# `manifest.pdxsig` is pushed to
+#   https://pkgs.paideia-os/main/mount.pdxfs/1.0.0/manifest.pdxsig
+# alongside the compiled artifacts.
+#
+# Format mirrors `libpdx-volume`'s `release/manifest.pdxsig.txt` (this
+# wave's other satellite, first through M5) byte-for-byte in structure
+# — see that file for the worked template this one follows. Every
+# `<BLAKE3-*>` / `<...-KID-*>` / `<...-SIG-*>` slot below is a
+# placeholder the release tool fills in from the working tree at tag
+# time; NONE are computed by this milestone.
+#
+# Reference:
+#   design/paideia-as/v0.20-issue-1025-pq-signing.md         — Hybrid,
+#     sign_release_artifact, HybridSignature (Ed25519 || ML-DSA-65).
+#   design/02-development-environment.md §1140                — hybrid
+#     release-artifact signature rationale (Ed25519 + ML-DSA-65).
+#   design/tooling/plan.md §6.3                               — package
+#     repository layout, `manifest.pdxsig` per version directory.
+#   design/tooling/volume-tooling-ux.md §9.3 (paideia-os)     — M5-001
+#     scope (dual-signed release + .pdxdoc + mirror push) for this repo.
+
+format-version:      1
+manifest-schema:     paideia-manifest-pdxsig@1
+package-name:        mount.pdxfs
+package-version:     1.0.0
+package-release:     R53-M5
+package-license:     MIT
+source-repo:         https://github.com/paideia-os/mount.pdxfs
+source-commit:       <TAG-v1.0.0-COMMIT-SHA>   # release tool fills in
+source-tag:          v1.0.0
+
+# ---------------------------------------------------------------
+# Artifact set — every file the compiled package ships. The hash
+# discipline is BLAKE3-256, upper 32 bytes rendered as 64 hex chars.
+# The release tool recomputes each hash from the working tree at the
+# v1.0.0 tag before writing the binary manifest. The order below is
+# stable (lexicographic within each section) so the concatenated
+# hash-input is reproducible across signers.
+# ---------------------------------------------------------------
+
+[artifacts.source]
+caps.decl                          blake3-256 = <BLAKE3-caps.decl>
+src/argv.pdx                       blake3-256 = <BLAKE3-argv.pdx>
+src/audit_wire.pdx                 blake3-256 = <BLAKE3-audit_wire.pdx>
+src/elevate.pdx                    blake3-256 = <BLAKE3-elevate.pdx>
+src/main.pdx                       blake3-256 = <BLAKE3-main.pdx>
+src/mount_op.pdx                   blake3-256 = <BLAKE3-mount_op.pdx>
+src/mount_record.pdx               blake3-256 = <BLAKE3-mount_record.pdx>
+src/pipe_wire.pdx                  blake3-256 = <BLAKE3-pipe_wire.pdx>
+src/volume_cap.pdx                 blake3-256 = <BLAKE3-volume_cap.pdx>
+
+[artifacts.doc]
+doc/mount.pdxfs.pdxdoc             blake3-256 = <BLAKE3-mount.pdxfs.pdxdoc>
+
+[artifacts.tests]
+tests/README.md                    blake3-256 = <BLAKE3-tests-README.md>
+tests/test_elevate_system.pdx      blake3-256 = <BLAKE3-test_elevate_system.pdx>
+tests/test_elevate_timeout.pdx     blake3-256 = <BLAKE3-test_elevate_timeout.pdx>
+tests/test_failure_matrix.pdx      blake3-256 = <BLAKE3-test_failure_matrix.pdx>
+tests/test_happy_mnt.pdx           blake3-256 = <BLAKE3-test_happy_mnt.pdx>
+
+[artifacts.design]
+design/architecture.md             blake3-256 = <BLAKE3-architecture.md>
+
+[artifacts.legal]
+LICENSE                            blake3-256 = <BLAKE3-LICENSE>
+README.md                          blake3-256 = <BLAKE3-README.md>
+CHANGELOG.md                       blake3-256 = <BLAKE3-CHANGELOG.md>
+
+# ---------------------------------------------------------------
+# Cross-repo dependencies. The consumer's package tool verifies that
+# every `depends-on` row is satisfied by an installed package at a
+# compatible version.
+# ---------------------------------------------------------------
+
+[depends-on]
+libpdx-volume         >= 1.0.0    # vol_kind_narrow (link edge still open, see design/architecture.md §10.1)
+libpdx-audit          >= 0.2.0    # AuditClient::audit_begin/audit_commit
+libpdx-elevate        >= 1.1.0    # declared; not dispatched (fail-closed stub, see §11.1)
+
+# ---------------------------------------------------------------
+# Substrate contracts — what MUST be present in the runtime for the
+# compiled artifact to link and execute correctly.
+# ---------------------------------------------------------------
+
+[substrate]
+paideia-as-toolchain    >= 0.21.0
+kernel-cap-kind         = KIND_USER (0x190)
+kernel-cap-kind         = KIND_VOLUME (0x1A0)
+kernel-cap-kind         = KIND_PDXFS_MOUNT_TABLE (0x1A5)
+kernel-cap-kind         = KIND_ELEVATE_CHANNEL (0x191)             # placeholder, no broker cap bound
+kernel-syscall          = sys_mount (sysno 75)                     # dispatch-unwired as of this release
+                          — every non-dry-run invocation observes
+                          result_code: ENOSYS until dispatch_mount
+                          is wired for real (src/mount_op.pdx §KERNEL
+                          GAP #1).
+
+# ---------------------------------------------------------------
+# Signature block — dual-signed per design/02-development-environment.md
+# §1140 (hybrid Ed25519 + ML-DSA-65). Both signatures cover the SAME
+# canonical byte-stream: the manifest body above (everything before
+# the [signatures] marker line) hashed with BLAKE3-256 and signed via
+# paideia-pq-sign::sign_release_artifact. Verification is AND-semantics:
+# both signatures MUST verify; failure of either rejects the package.
+#
+# NOT PERFORMED AT THIS MILESTONE. The paideia-as `mldsa65_sign`
+# intrinsic requires a live 32-byte ML-DSA-65 seed key, and this repo
+# holds no such key material — a signing seed is release-line custody,
+# never repo-resident. The signature block below is left as the
+# documented placeholder value `SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN`
+# in every slot the real dual-sign pass would fill; see
+# release/RELEASE-1.0.0.md §3 for the full rationale and the flag for
+# main.
+# ---------------------------------------------------------------
+
+[signatures]
+signer-identity      = paideia-release-line
+signer-key-source    = design/02-development-environment.md §1164
+                       (hardware-backed in CI — TPM 2.0 on the release
+                       runner, or a cloud KMS pending PQ-KMS
+                       availability check per that section's TODO).
+signature-scheme     = hybrid-ed25519+ml-dsa-65 (paideia-pq-hybrid-v1)
+hash-input-algo      = blake3-256
+hash-input-domain    = "paideia-release-artifact\x00" || manifest-body-bytes
+                       (matches paideia-pq-sign::sign_release_artifact
+                       domain separation, crates/paideia-pq-sign/src/
+                       release.rs.)
+
+ed25519-key-id       = SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN
+ed25519-signature    = SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN
+
+ml-dsa-65-key-id     = SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN
+ml-dsa-65-signature  = SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN
+
+# End of manifest.pdxsig source. The release tool ships a canonical
+# binary form (`.pdxsig`) alongside this source form; keeping both in
+# the repo means a downstream auditor can diff the source-form manifest
+# against the binary the mirror served, without needing to re-run the
+# hash pass on the repo tree. The dual-sign pass that fills in
+# [signatures] above and every `<BLAKE3-*>` placeholder is a release-
+# time step performed with live key material outside this repo and
+# outside this milestone.

@@ -238,4 +238,240 @@ module Elevate = structure {
         ret;
       }
     }
+
+  // ==========================================================================
+  // M3-001 (issue #7): mount-point-class table (§4.2) + libpdx-elevate
+  // fail-closed stub
+  // ==========================================================================
+  //
+  // This issue's own scope narrows §4.2's five-class table to FOUR
+  // buckets (its own task text, reproduced here): USER_SUBTREE (no
+  // elevate: `/home/**`, `/mnt/**`, `/tmp/**`), SYSTEM_PATH (elevate +
+  // audit-heavy: `/system/**`, `/boot/**`, `/dev/**`), CROSS_USER
+  // (elevate: some other user's `/home/**` subtree), INVALID (anything
+  // else). `mount_point_class` below implements exactly the same three
+  // prefix groups this file's own M2-003 `elevate_needed` already
+  // classified (reusing `mount_elev_prefix_match` verbatim, no new
+  // string-matching logic needed) plus the same INVALID default -- only
+  // the RETURN-VALUE VOCABULARY changes (four named `MPC_*` constants
+  // instead of `elevate_needed`'s three `ELEVATE_*` ones), so main.pdx's
+  // M3 dispatch can read "system-path" and "cross-user" as two distinct
+  // reasons elevation is required, matching this issue's own class
+  // names, even though this landing's classifier cannot yet TELL them
+  // apart (see immediately below).
+  //
+  // `elevate_needed` (M2-003, above) is kept byte-for-byte unmodified --
+  // no caller in this repo uses it any more (main.pdx's M3 dispatch
+  // calls `mount_point_class` instead), but removing a still-correct,
+  // still-documented public entry point is unnecessary churn per this
+  // repo's own "kept, unmodified" precedent (`mount_record.pdx`'s
+  // `mount_record_emit_dry_run`, kept alongside M2's newer
+  // `mount_record_emit_result`).
+  //
+  // ----------------------------------------------------------------------
+  // MPC_CROSS_USER is a named ordinal this landing's classifier can
+  // never actually return -- a real gap, not a rounding error
+  // ----------------------------------------------------------------------
+  //
+  // Telling "/home/alice/" (the invoker's own subtree, §4.2's real
+  // never-elevate exemption) apart from "/home/bob/" (§4.2's real
+  // founder-only-elevate default) needs the invoker's OWN username -- a
+  // `KIND_USER` identity lookup this tool has never had at any landing
+  // (M2-003's own header flagged this exact gap for "M3-001 to close";
+  // this issue IS M3-001, and the gap is still open: no `KIND_USER`-
+  // resolving syscall or cap-invoke op reachable from this tool's own
+  // `caps.decl` surface exists to resolve). `mount_point_class`
+  // therefore keeps M2-003's own conservative (over-permissive relative
+  // to §4.2) choice: EVERY `/home/**` path -- the invoker's own or
+  // anyone else's -- classifies as `MPC_USER_SUBTREE`, never `MPC_
+  // CROSS_USER`. `MPC_CROSS_USER = 2` is defined and reserved in the
+  // return-value vocabulary (and main.pdx's M3 dispatch treats it
+  // identically to `MPC_SYSTEM_PATH` wherever it appears, per this
+  // issue's own instruction that both buckets "need elevate") so that
+  // the day a real invoker-identity lookup lands, only this function's
+  // BODY needs a `/home/<own-user>/` vs `/home/<other>/` split added --
+  // no caller-side ABI change, the same "aspirational value, kept wired,
+  // unreachable today" posture this repo's own `mount_op.pdx` documents
+  // for `MOUNT_OP_BACKEND_PDXFS_BLOCK`'s real-mount-path sibling.
+  //
+  // ----------------------------------------------------------------------
+  // libpdx-elevate wiring -- fail-closed STUB, mirroring mkfs.pdxfs's own
+  // M3-005 (#12) landing precedent exactly
+  // ----------------------------------------------------------------------
+  //
+  // This issue's own task text describes calling `libpdx-elevate.
+  // elevate_client_acquire` (or "the actual API in libpdx-elevate/src/")
+  // for `MPC_SYSTEM_PATH` / `MPC_CROSS_USER`. A full read of `libpdx-
+  // elevate`'s real, mature (v1.1.0-in-progress) source finds a working
+  // `ElevateClientAcquire::elevate_client_acquire(caps, dur, req_buf,
+  // reply_ep_id, reply_buf, mint_ctx_buf) -> row_id | error` entry point
+  // -- but it REQUIRES the caller to already hold a `KIND_IPC_ENDPOINT`
+  // cap over `svc.elevate-broker` at `mint_ctx_buf`'s `parent_ep_slot`
+  // field, a prerequisite `libpdx-elevate`'s own README is explicit is
+  // "declared by whatever the caller links this library into, not by
+  // libpdx-elevate" itself. This repo's own `caps.decl` (M1 landing,
+  // unchanged since) declares `KIND_ELEVATE_CHANNEL = 0x191` as a
+  // PLACEHOLDER ONLY -- no code path in ANY landing of this repo has
+  // ever bound a real broker-endpoint cap, and no design doc or osarch
+  // coordination point has since minted mount.pdxfs one. Without that
+  // cap there is no honest `mint_ctx_buf.parent_ep_slot` value this file
+  // could fill in -- exactly the gap `mkfs.pdxfs`'s own `src/
+  // elevate_wire.pdx` (M3-005, #12) documents in full, over the
+  // identical library, for the identical reason.
+  //
+  // Rather than fabricate a plausible-looking `elevate_client_acquire`
+  // call against a field this repo cannot honestly populate (which would
+  // look real without being real -- the same trap `mkfs.pdxfs`'s own
+  // `pipe_wire.pdx` documents avoiding for its schema-hash question),
+  // `mount_elev_require_system` below always returns `MOUNT_ELEV_DENY`.
+  // This is this file's own honest, fail-closed answer to "can this
+  // process prove it holds elevation over this mount point": since no
+  // real elevation request can be constructed at all, "cannot prove
+  // GRANT" and "DENY" are the same externally observable outcome.
+  // `main.pdx`'s M3 dispatch therefore ALWAYS takes the `MountRecord::
+  // MR_RESULT_ELEVATION_STUB` exit for `MPC_SYSTEM_PATH` / `MPC_CROSS_
+  // USER` at this landing -- a DISTINCT result_code from M2's own `MR_
+  // RESULT_ELEVATION_REQUIRED` (which meant "this tool refuses to even
+  // try"; `ELEVATION_STUB` means "this tool ran the real classify step
+  // and knows elevation is genuinely required, but the broker hop itself
+  // is unprovisioned" -- a more honest signal for an operator or a
+  // future automated consumer to act on). The `MOUNT_ELEV_GRANT` return
+  // value and the GRANT arm of the caller's dispatch are real, wired
+  // code paths -- not dead code removed for tidiness -- kept so the day
+  // a real broker-endpoint cap exists, only this function's BODY needs
+  // to change to a real `elevate_client_acquire` + `elevate_client_
+  // require` sequence, no caller-side change.
+  //
+  // ----------------------------------------------------------------------
+  // Encoder-gap discipline (unchanged from M1/M2, restated for this
+  // addendum)
+  // ----------------------------------------------------------------------
+  //
+  // No `add reg, [mem]` anywhere. No `test` mnemonic. Reserved-label
+  // discipline: every new branch label in this addendum is prefixed
+  // `mount_elev_`.
+  //
+  // Upstream: design/tooling/volume-tooling-ux.md §4.2 (paideia-os);
+  // paideia-satellites/libpdx-elevate (README.md "API surface" +
+  // "Callers" sections, src/elevate_client_acquire.pdx); mkfs.pdxfs's
+  // own src/elevate_wire.pdx (M3-005, #12 -- the sibling-repo precedent
+  // this addendum's fail-closed posture and write-up structure mirror).
+
+  // --- mount_point_class return values (§4.2, this issue's own
+  //     four-bucket scope). ------------------------------------------------
+  pub let MPC_USER_SUBTREE : u64 = 0
+  pub let MPC_SYSTEM_PATH  : u64 = 1
+  pub let MPC_CROSS_USER   : u64 = 2
+  pub let MPC_INVALID      : u64 = 3
+
+  // --- mount_elev_require_system return values. ---------------------------
+  pub let MOUNT_ELEV_DENY  : u64 = 0
+  pub let MOUNT_ELEV_GRANT : u64 = 1
+
+  // ==========================================================================
+  // mount_point_class(mount_point_ptr) -> u64
+  //     (MPC_USER_SUBTREE | MPC_SYSTEM_PATH | MPC_CROSS_USER | MPC_INVALID)
+  //
+  // Real M3-001 classifier. Same three-prefix-group logic as this file's
+  // own M2-003 `elevate_needed`, re-exposed under the §4.2-matching
+  // return-value vocabulary this issue asks for; `MPC_CROSS_USER` is
+  // never actually produced by this body -- see module header addendum.
+  // Register plan identical to `elevate_needed`'s own (rbx =
+  // mount_point_ptr, pushed/popped around six nested `mount_elev_
+  // prefix_match` calls).
+  // ==========================================================================
+  pub let mount_point_class : (u64) -> u64 !{mem} @{} =
+    fn (mount_point_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M3-001 (#7): mount_point_class entry point. Byte-for-byte the same body shape as this file's own M2-003 elevate_needed (six nested mount_elev_prefix_match calls against the same six literals, same push/pop rbx discipline) -- only the three terminal return VALUES differ, matching this issue's own MPC_* vocabulary instead of elevate_needed's ELEVATE_* one: MPC_USER_SUBTREE=0 (home/mnt/tmp), MPC_SYSTEM_PATH=1 (system/boot/dev), MPC_INVALID=3 (unmatched default). MPC_CROSS_USER=2 is never reached by this body -- see module header addendum for why (no KIND_USER identity lookup exists to distinguish an own-subtree /home/ path from another user's). Labels prefixed mount_elev_mpc_ to stay distinct from elevate_needed's own mount_elev_ labels in the same file.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                        // rbx = mount_point_ptr
+
+        // ---- USER_SUBTREE: /home/, /mnt/, /tmp/ ----------------------------
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_home];
+        mov rdx, 6;                          // ELEV_LEN_HOME
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_mpc_user_subtree;
+
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_mnt];
+        mov rdx, 5;                          // ELEV_LEN_MNT
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_mpc_user_subtree;
+
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_tmp];
+        mov rdx, 5;                          // ELEV_LEN_TMP
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_mpc_user_subtree;
+
+        // ---- SYSTEM_PATH: /system/, /boot/, /dev/ --------------------------
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_system];
+        mov rdx, 8;                          // ELEV_LEN_SYSTEM
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_mpc_system_path;
+
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_boot];
+        mov rdx, 6;                          // ELEV_LEN_BOOT
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_mpc_system_path;
+
+        mov rdi, rbx;
+        lea rsi, [rip + elev_lit_dev];
+        mov rdx, 5;                          // ELEV_LEN_DEV
+        call mount_elev_prefix_match;
+        cmp rax, 0;
+        jne mount_elev_mpc_system_path;
+
+        mov rax, 3;                          // MPC_INVALID
+        jmp mount_elev_mpc_done;
+
+      mount_elev_mpc_user_subtree:
+        xor rax, rax;                        // MPC_USER_SUBTREE
+        jmp mount_elev_mpc_done;
+
+      mount_elev_mpc_system_path:
+        mov rax, 1;                          // MPC_SYSTEM_PATH
+
+      mount_elev_mpc_done:
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mount_elev_require_system(mount_point_ptr, mpc_class) -> u64
+  //     (MOUNT_ELEV_DENY | MOUNT_ELEV_GRANT -- see module header addendum:
+  //     DENY is the only value this landing's body can ever produce)
+  //
+  //   rdi = mount_point_ptr  (unused by this landing's body -- kept as a
+  //                           parameter so a future real
+  //                           elevate_client_acquire call has it
+  //                           available, without an ABI change, since a
+  //                           real call needs it for audit/logging
+  //                           context)
+  //   rsi = mpc_class        (MPC_SYSTEM_PATH or MPC_CROSS_USER,
+  //                           whichever main.pdx's dispatch matched;
+  //                           likewise unused by this landing's body)
+  //
+  // Pure leaf, no branches, no nested call, no push/pop.
+  // ==========================================================================
+  pub let mount_elev_require_system : (u64, u64) -> u64 !{} @{} =
+    fn (mount_point_ptr: u64) (mpc_class: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "mount.pdxfs.M3-001 (#7): mount_elev_require_system entry point. mount_point_ptr (rdi) and mpc_class (rsi) are accepted but READ BY NOTHING in this landing's body -- see module header addendum for why no real elevate_client_acquire call can be honestly constructed yet (no broker-endpoint cap). `mov rax, 0` (MOUNT_ELEV_DENY) unconditionally; `ret`. Pure leaf -- no push/pop, no `add reg,[mem]`, no `test`.",
+      block: {
+        mov rax, 0;                          // MOUNT_ELEV_DENY (fail-closed; see module header)
+        ret;
+      }
+    }
 }

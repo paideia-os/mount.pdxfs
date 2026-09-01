@@ -1,0 +1,179 @@
+// src/pipe_wire.pdx — mount.pdxfs.M3-003 (issue #9) — semantic-pipe
+// PdxFsMountRecord@0.1 schema bind + emit, falling back to a documented
+// line-based rendering.
+//
+// ----------------------------------------------------------------------
+// Why this is a fallback, not a real libpdx-semantic-pipe bind
+// ----------------------------------------------------------------------
+//
+// `libpdx-semantic-pipe` (github.com/paideia-os/libpdx-semantic-pipe) is
+// a real, released library (v1.0.0, wave R49, M1-M5 landed) with a
+// working `Send::send_record(fd, rec_ptr, rec_len)` entry point that
+// frames a record as `[8B R20b header | 32B schema hash | rec_len body]`
+// over `sys_ipc_send`. A caller binds a schema to an fd one of two ways:
+// `Binding::libpdx_semantic_pipe_bind(fd, schema_hash_ptr)` (a raw
+// 32-byte hash the caller already knows) or `Registry::bind_by_name(fd,
+// name_ptr, name_len)` (resolve a schema NAME like "PdxFsMountRecord" to
+// its hash via `svc.schema-registry`).
+//
+// `Registry::bind_by_name` is confirmed INERT as of this landing: per
+// paideia-os#2000 ("R90-XREPO.006 Stand up libpdx-schema-registry
+// service"), the service broker only knows two hardcoded test names
+// (`svc.foo`/`svc.foobar`) and no `libpdx-schema-registry` service exists
+// anywhere in the org -- `bind_by_name` always returns 304 (LOOKUP_FAIL).
+// `mkfs.pdxfs`'s own `src/pipe_wire.pdx` (M3-003, #10) hit the identical
+// wall over the identical schema-registry gap and reached the identical
+// fallback conclusion; this file mirrors that landing's shape exactly,
+// swapped to this tool's own schema name and record shape.
+//
+// Per this issue's own fallback instruction, `mount.pdxfs` therefore
+// does NOT link `libpdx-semantic-pipe` at M3: every PdxFsMountRecord@0.1
+// this tool emits is the SAME line-based `sys_write(1, ...)` rendering
+// M1/M2's `MountRecord::mount_record_emit_result` already produces (src/
+// mount_record.pdx), now preceded by one documented header line
+// (`mount_pipe_lit_header` below) that tells a human or script reading stdout
+// exactly why: "semantic-pipe emit deferred (svc.schema-registry not yet
+// live)". The field values themselves are unaffected. Once
+// `libpdx-schema-registry` lands and #2000 closes, this file's one
+// wrapper is the ONLY call site that needs to change (to a real `bind_
+// by_name` + `send_record` pair) -- `main.pdx` already goes through it
+// rather than calling `MountRecord::mount_record_emit_result` directly,
+// so this is a pure body swap with no ripple.
+//
+// ----------------------------------------------------------------------
+// One wrapper, not two — a deliberate simplification over mkfs.pdxfs's
+// own M3-003 shape
+// ----------------------------------------------------------------------
+//
+// `mkfs.pdxfs`'s own `pipe_wire.pdx` carries TWO wrappers
+// (`mkfs_sp_emit_dry_run` / `mkfs_sp_emit_result`) because that repo's
+// `FormatRecord` module still has two independent emitters with
+// different argument shapes (a 3-argument dry-run preview and a
+// separate 3-argument result emitter) left over from its own M1/M2
+// history. `mount.pdxfs`'s own M2 landing already UNIFIED this: `src/
+// mount_record.pdx`'s `mount_record_emit_result` is the single emitter
+// every M2 code path calls, dry-run included (`MR_RESULT_DRY_RUN` is
+// just one more `result_code` value among four, not a separate function
+// signature) -- `mount_record_emit_dry_run` (the older M1 shape) still
+// exists but has had no M2/M3 caller since M2 landed. There is therefore
+// exactly ONE record-shaped call site left to wrap here:
+// `mount_pipe_emit_result`, a thin 5-argument passthrough to `mount_
+// record_emit_result` with the deferral header printed first. `main.pdx`
+// calls this one wrapper on every terminal path (dry-run, elevation-
+// stub, every failure-taxonomy code, and real success alike).
+//
+// ----------------------------------------------------------------------
+// Why the header is printed before every record rather than once
+// ----------------------------------------------------------------------
+//
+// Every code path in this repo emits at most one terminal
+// PdxFsMountRecord@0.1 per process invocation. Printing the header
+// unconditionally immediately before that single record is therefore
+// already equivalent to "print once per process" in every reachable
+// call graph this repo has; adding a "have I already printed this"
+// latch would be defensive complexity with no reachable case where it
+// changes output -- identical reasoning to mkfs.pdxfs's own pipe_wire.pdx.
+//
+// ----------------------------------------------------------------------
+// Register-preservation note: why the incoming arguments are staged
+// into callee-save registers, not caller-save scratch
+// ----------------------------------------------------------------------
+//
+// This wrapper issues one `sys_write` (for the header) BEFORE
+// delegating to `mount_record_emit_result`, which needs all five
+// original incoming arguments. Per this repo's own established
+// convention (mirroring mkfs.pdxfs's design/architecture.md §7,
+// restated in its own `format_record.pdx`): the kernel's #743 info-leak
+// hardening zeroes every CALLER-save register (`rdi`/`rsi`/`rdx`/`r8`/
+// `r9`/`r10`) -- not just the usual `rcx`/`r11` SYSCALL clobbers --
+// before every `sysret`. Staging the incoming arguments into any
+// caller-save register across the header's `syscall` instruction would
+// therefore silently lose them. This function instead stages all FIVE
+// incoming arguments into the five SysV callee-save registers this
+// codebase reserves for exactly this purpose (`rbx`/`r12`/`r13`/`r14`/
+// `r15`), pushed on entry and popped (reverse order) before the single
+// `ret` -- one more register than mkfs.pdxfs's own two 3-argument
+// wrappers need, since `mount_record_emit_result`'s own 5-argument
+// signature (volume_cap_ptr, mount_point_ptr, flags, result_code,
+// mount_id) is wider than either of `FormatRecord`'s two emitters.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic. Reserved-label
+// discipline: this file's one function needs no internal branch labels.
+//
+// Upstream: design/tooling/r49-r50-plan.md §3.2 (paideia-os, the
+// semantic-pipe design); github.com/paideia-os/libpdx-semantic-pipe (the
+// real, released library this file does not yet link); GitHub issue
+// paideia-os#2000 (the inert-registry blocker this file documents and
+// works around); mkfs.pdxfs's own src/pipe_wire.pdx (M3-003, #10 -- the
+// sibling-repo precedent this file's fallback posture and write-up
+// structure mirror).
+
+module PipeWire = structure {
+
+  // --- Deferral header, printed to fd 1 immediately before every
+  //     PdxFsMountRecord@0.1 line this repo emits. Length verified via
+  //     `python3 -c "print(len(...))"`. ------------------------------------
+  pub let mount_pipe_lit_header     : [u8; 133] = "# semantic-pipe emit deferred (svc.schema-registry not yet live, paideia-os#2000) -- PdxFsMountRecord@0.1 line-based fallback below\n\0"
+  pub let mount_pipe_lit_header_len : u64 = 132
+
+  // ==========================================================================
+  // mount_pipe_emit_result(volume_cap_ptr, mount_point_ptr, flags,
+  //                       result_code, mount_id) -> ()
+  //
+  // Thin wrapper around MountRecord::mount_record_emit_result (M2, src/
+  // mount_record.pdx, extended at M3 #10 with the full failure-taxonomy
+  // result codes -- see that file's own header): prints mount_pipe_lit_header
+  // first, then delegates all five arguments unchanged. This is now
+  // main.pdx's ONLY call site for a terminal PdxFsMountRecord@0.1 emit --
+  // no code path in this repo calls MountRecord::mount_record_emit_
+  // result directly any more.
+  //
+  // Register plan: rbx=volume_cap_ptr, r12=mount_point_ptr, r13=flags,
+  // r14=result_code, r15=mount_id, all SysV callee-save, pushed on entry
+  // and popped before the single `ret` -- see module header's note on
+  // why a caller-save staging register would not survive the
+  // intervening header `syscall`.
+  // ==========================================================================
+  pub let mount_pipe_emit_result : (u64, u64, u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (volume_cap_ptr: u64) (mount_point_ptr: u64) (flags: u64) (result_code: u64) (mount_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mount.pdxfs.M3-003 (#9): mount_pipe_emit_result entry point. push rbx; push r12; push r13; push r14; push r15 before repurposing any. rbx=volume_cap_ptr, r12=mount_point_ptr, r13=flags, r14=result_code, r15=mount_id. sys_write(1, mount_pipe_lit_header, 132) -- SC+ ID 1, rdi/rsi/rdx/rax all freshly loaded for this call (per module header, none of rbx/r12/r13/r14/r15 are touched by it or by the kernel's post-syscall caller-save zeroing). Then rdi=rbx, rsi=r12, rdx=r13, rcx=r14, r8=r15, `call mount_record_emit_result` (src/mount_record.pdx) -- delegates the real rendering verbatim, now covering every MR_RESULT_* code as of M3 #10. Pops r15/r14/r13/r12/rbx (reverse push order) and returns (no value; caller sys_exits itself, matching mount_record_emit_result's own contract). No `add reg,[mem]`. No `test`. This function has no internal branch, so no label prefix is needed.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = volume_cap_ptr
+        mov r12, rsi;                       // r12 = mount_point_ptr
+        mov r13, rdx;                       // r13 = flags
+        mov r14, rcx;                       // r14 = result_code
+        mov r15, r8;                        // r15 = mount_id
+
+        mov rdi, 1;
+        lea rsi, [rip + mount_pipe_lit_header];
+        mov rdx, 132;                       // mount_pipe_lit_header_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        mov rcx, r14;
+        mov r8, r15;
+        call mount_record_emit_result;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

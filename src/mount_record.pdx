@@ -90,6 +90,70 @@ module MountRecord = structure {
   pub let MR_RESULT_ELEVATION_REQUIRED : u64 = 2
   pub let MR_RESULT_KERNEL_ERROR       : u64 = 3
 
+  // --- mount.pdxfs.M3-004 (issue #10): the full failure-taxonomy
+  //     extension. §4.4 of design/tooling/volume-tooling-ux.md asks for
+  //     "every kernel errno + policy refusal" to map to a distinct
+  //     result_code rather than the single M2-era KERNEL_ERROR
+  //     catch-all. Two source families feed this taxonomy:
+  //
+  //     (a) Policy refusals this repo's OWN pipeline can detect before
+  //     ever reaching a syscall -- MPC_INVALID from Elevate::mount_
+  //     point_class (#7, previously folded into KERNEL_ERROR at M2, now
+  //     distinct), VolumeCap::VC_ERR_BAD_URI / VC_ERR_NARROW_FAILED
+  //     (#4, likewise previously folded), and the M3-001 (#7)
+  //     fail-closed elevate-stub outcome itself (a NEW code,
+  //     ELEVATION_STUB, distinct from M2's own ELEVATION_REQUIRED -- see
+  //     src/elevate.pdx's own module header for exactly why these two
+  //     are different signals: REQUIRED means "this tool refuses to
+  //     even try", STUB means "this tool tried the real classify step
+  //     and knows elevation is genuinely required, but the broker hop
+  //     is unprovisioned").
+  //
+  //     (b) The real kernel errno set `sys_mount` (sysno 75) can return,
+  //     per `grep -n "pub let SYS_MOUNT_" src/kernel/core/syscall/
+  //     sys_mount.pdx` (paideia-os, 2026-08-31): SYS_MOUNT_EINVAL_BACKEND
+  //     (0xFFFFED60), SYS_MOUNT_EINVAL_MP_LEN (0xFFFFED61), SYS_MOUNT_
+  //     EINVAL_DEV_LEN (0xFFFFED62), SYS_MOUNT_UNIMPL_PDXFS_BLOCK
+  //     (0xFFFFED63), SYS_MOUNT_MOUNT_FAIL (0xFFFFED64), SYS_MOUNT_EFAULT
+  //     (0xFFFFED65) -- six distinct sentinels, none of which src/
+  //     mount_op.pdx's own M2 body ever distinguished (it classified
+  //     ANY out-of-band syscall return, including these six, as the same
+  //     generic MOUNT_OP_ERR_KERNEL). A seventh sentinel, raw -ENOSYS
+  //     (0xFFFFFFFFFFFFFFDA), is ALSO given its own code: per src/
+  //     mount_op.pdx's own KERNEL GAP #1 write-up, `dispatch_mount` is
+  //     still an unconditional `-ENOSYS` stub as of this landing, so
+  //     ENOSYS is in practice the ONE value `mount_record_classify_
+  //     mount_errno` below actually observes today -- every other
+  //     sentinel's case is real, wired, correctly-classified code kept
+  //     ready for the day dispatch_mount is wired for real (mirrors this
+  //     repo's own "aspirational value, kept wired, unreachable today"
+  //     posture already established for MOUNT_ELEV_GRANT and
+  //     mount_op.pdx's real-mount ABI).
+  //
+  //     `MR_RESULT_KERNEL_ERROR` (3, unchanged) remains the fallback for
+  //     any raw errno matching NONE of the seven sentinels above --
+  //     `mount_record_classify_mount_errno`'s own default arm, not a
+  //     dead code path.
+  //
+  //     `MR_RESULT_AUDIT_FAIL` (15) is reserved for a future stricter
+  //     mode gating output on a proven-successful audit commit (mirrors
+  //     mkfs.pdxfs's own FR_RESULT_AUDIT_FAIL, likewise defined but
+  //     never emitted by that repo's M3 landing) -- src/audit_wire.pdx's
+  //     own "forgiving posture" means this M3 landing never actually
+  //     emits MR_RESULT_AUDIT_FAIL from any call site. ---------------------
+  pub let MR_RESULT_ELEVATION_STUB      : u64 = 4
+  pub let MR_RESULT_INVALID_MOUNT_POINT : u64 = 5
+  pub let MR_RESULT_BAD_VOLUME_CAP      : u64 = 6
+  pub let MR_RESULT_NARROW_FAILED       : u64 = 7
+  pub let MR_RESULT_EINVAL_BACKEND      : u64 = 8
+  pub let MR_RESULT_EINVAL_MP_LEN       : u64 = 9
+  pub let MR_RESULT_EINVAL_DEV_LEN      : u64 = 10
+  pub let MR_RESULT_UNIMPL_BACKEND      : u64 = 11
+  pub let MR_RESULT_MOUNT_FAIL          : u64 = 12
+  pub let MR_RESULT_EFAULT              : u64 = 13
+  pub let MR_RESULT_ENOSYS              : u64 = 14
+  pub let MR_RESULT_AUDIT_FAIL          : u64 = 15
+
   pub let mr_lit_result_code     : [u8; 16] = ", result_code: \0"
   pub let mr_lit_result_code_len : u64 = 15
 
@@ -104,6 +168,44 @@ module MountRecord = structure {
 
   pub let mr_lit_result_kernel_error     : [u8; 13] = "KERNEL_ERROR\0"
   pub let mr_lit_result_kernel_error_len : u64 = 12
+
+  // --- M3-004 (#10) failure-taxonomy label literals. Lengths verified
+  //     via `python3 -c "print(len(...))"`. -------------------------------
+  pub let mr_lit_result_elevation_stub      : [u8; 15] = "ELEVATION_STUB\0"
+  pub let mr_lit_result_elevation_stub_len  : u64 = 14
+
+  pub let mr_lit_result_invalid_mount_point     : [u8; 20] = "INVALID_MOUNT_POINT\0"
+  pub let mr_lit_result_invalid_mount_point_len : u64 = 19
+
+  pub let mr_lit_result_bad_volume_cap      : [u8; 15] = "BAD_VOLUME_CAP\0"
+  pub let mr_lit_result_bad_volume_cap_len  : u64 = 14
+
+  pub let mr_lit_result_narrow_failed     : [u8; 14] = "NARROW_FAILED\0"
+  pub let mr_lit_result_narrow_failed_len : u64 = 13
+
+  pub let mr_lit_result_einval_backend     : [u8; 15] = "EINVAL_BACKEND\0"
+  pub let mr_lit_result_einval_backend_len : u64 = 14
+
+  pub let mr_lit_result_einval_mplen     : [u8; 14] = "EINVAL_MP_LEN\0"
+  pub let mr_lit_result_einval_mplen_len : u64 = 13
+
+  pub let mr_lit_result_einval_devlen     : [u8; 15] = "EINVAL_DEV_LEN\0"
+  pub let mr_lit_result_einval_devlen_len : u64 = 14
+
+  pub let mr_lit_result_unimpl_backend     : [u8; 15] = "UNIMPL_BACKEND\0"
+  pub let mr_lit_result_unimpl_backend_len : u64 = 14
+
+  pub let mr_lit_result_mount_fail     : [u8; 11] = "MOUNT_FAIL\0"
+  pub let mr_lit_result_mount_fail_len : u64 = 10
+
+  pub let mr_lit_result_efault     : [u8; 7] = "EFAULT\0"
+  pub let mr_lit_result_efault_len : u64 = 6
+
+  pub let mr_lit_result_enosys     : [u8; 7] = "ENOSYS\0"
+  pub let mr_lit_result_enosys_len : u64 = 6
+
+  pub let mr_lit_result_audit_fail     : [u8; 11] = "AUDIT_FAIL\0"
+  pub let mr_lit_result_audit_fail_len : u64 = 10
 
   pub let mr_lit_mount_id     : [u8; 13] = ", mount_id: \0"
   pub let mr_lit_mount_id_len : u64 = 12
@@ -425,7 +527,7 @@ module MountRecord = structure {
   pub let mount_record_emit_result : (u64, u64, u64, u64, u64) -> () !{mem, sysreg} @{fs} =
     fn (volume_cap_ptr: u64) (mount_point_ptr: u64) (flags: u64) (result_code: u64) (mount_id: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "mount.pdxfs.M2 (#4/#5/#6): mount_record_emit_result entry point. SysV callee-save discipline: push rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any of them -- popped in reverse order before the single `ret`. rbx=volume_cap_ptr, r12=mount_point_ptr, r13=flags, r14=result_code, r15=mount_id, all now-saved callee-save registers surviving the nested `call mount_record_strlen` / `call mount_record_print_decimal` invocations and every `syscall` (both callees clobber only caller-save registers per their own justifications; SYSCALL preserves callee-save registers per amd64 fast-syscall convention). Segments 1-6 are byte-for-byte the same shape as mount_record_emit_dry_run's own segments 1-6, with segment 6 now delegating to `call mount_record_print_decimal` (rdi=r13) instead of an inlined div loop. Segment 7: sys_write(1, mr_lit_result_code, 15). Segment 8: a cmp/je chain over r14 against 0/1/2/3 selects one of four (lit_ptr, lit_len) pairs (mr_lit_result_dry_run/7, mr_lit_result_ok/2, mr_lit_result_elevation/18, mr_lit_result_kernel_error/12 -- default/unrecognised code falls through to the KERNEL_ERROR literal as a defensive catch-all, never silently printing nothing) then one sys_write of the selected pair. Segment 9: `cmp r14, 1 (MR_RESULT_OK); jne mount_mr_er_close` gates the ENTIRE mount_id sub-segment -- on a match, sys_write(1, mr_lit_mount_id, 12) then `call mount_record_print_decimal` (rdi=r15). Segment 10 (mount_mr_er_close): sys_write(1, mr_lit_close, 3). Pops r15/r14/r13/r12/rbx (reverse push order) and returns. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mount_mr_er_.",
+      justification: "mount.pdxfs.M2 (#4/#5/#6) + M3-004 (#10): mount_record_emit_result entry point. SysV callee-save discipline: push rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any of them -- popped in reverse order before the single `ret`. rbx=volume_cap_ptr, r12=mount_point_ptr, r13=flags, r14=result_code, r15=mount_id, all now-saved callee-save registers surviving the nested `call mount_record_strlen` / `call mount_record_print_decimal` invocations and every `syscall` (both callees clobber only caller-save registers per their own justifications; SYSCALL preserves callee-save registers per amd64 fast-syscall convention). Segments 1-6 are byte-for-byte the same shape as mount_record_emit_dry_run's own segments 1-6, with segment 6 now delegating to `call mount_record_print_decimal` (rdi=r13) instead of an inlined div loop. Segment 7: sys_write(1, mr_lit_result_code, 15). Segment 8, extended at M3-004 (#10) from four to fifteen cases: a cmp/je chain over r14 against 0/1/2/4/5/6/7/8/9/10/11/12/13/14/15 selects one of fifteen (lit_ptr, lit_len) pairs -- mr_lit_result_dry_run/7 (0), mr_lit_result_ok/2 (1), mr_lit_result_elevation/18 (2), mr_lit_result_elevation_stub/14 (4), mr_lit_result_invalid_mount_point/19 (5), mr_lit_result_bad_volume_cap/14 (6), mr_lit_result_narrow_failed/13 (7), mr_lit_result_einval_backend/14 (8), mr_lit_result_einval_mplen/13 (9), mr_lit_result_einval_devlen/14 (10), mr_lit_result_unimpl_backend/14 (11), mr_lit_result_mount_fail/10 (12), mr_lit_result_efault/6 (13), mr_lit_result_enosys/6 (14), mr_lit_result_audit_fail/10 (15) -- with value 3 (MR_RESULT_KERNEL_ERROR) and any other unrecognised value both falling through to the unconditional `jmp mount_mr_er_lit_kernel_error` at the chain's end (defensive catch-all, never silently printing nothing), then one sys_write of the selected pair via the shared mount_mr_er_lit_write tail. Segment 9: `cmp r14, 1 (MR_RESULT_OK); jne mount_mr_er_close` gates the ENTIRE mount_id sub-segment -- on a match, sys_write(1, mr_lit_mount_id, 12) then `call mount_record_print_decimal` (rdi=r15). Segment 10 (mount_mr_er_close): sys_write(1, mr_lit_close, 3). Pops r15/r14/r13/r12/rbx (reverse push order) and returns. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mount_mr_er_.",
       block: {
         push rbx;
         push r12;
@@ -496,7 +598,31 @@ module MountRecord = structure {
         je mount_mr_er_lit_ok;
         cmp r14, 2;                         // MR_RESULT_ELEVATION_REQUIRED
         je mount_mr_er_lit_elevation;
-        jmp mount_mr_er_lit_kernel_error;   // MR_RESULT_KERNEL_ERROR or unrecognised
+        cmp r14, 4;                         // MR_RESULT_ELEVATION_STUB
+        je mount_mr_er_lit_elevation_stub;
+        cmp r14, 5;                         // MR_RESULT_INVALID_MOUNT_POINT
+        je mount_mr_er_lit_invalid_mount_point;
+        cmp r14, 6;                         // MR_RESULT_BAD_VOLUME_CAP
+        je mount_mr_er_lit_bad_volume_cap;
+        cmp r14, 7;                         // MR_RESULT_NARROW_FAILED
+        je mount_mr_er_lit_narrow_failed;
+        cmp r14, 8;                         // MR_RESULT_EINVAL_BACKEND
+        je mount_mr_er_lit_einval_backend;
+        cmp r14, 9;                         // MR_RESULT_EINVAL_MP_LEN
+        je mount_mr_er_lit_einval_mplen;
+        cmp r14, 10;                        // MR_RESULT_EINVAL_DEV_LEN
+        je mount_mr_er_lit_einval_devlen;
+        cmp r14, 11;                        // MR_RESULT_UNIMPL_BACKEND
+        je mount_mr_er_lit_unimpl_backend;
+        cmp r14, 12;                        // MR_RESULT_MOUNT_FAIL
+        je mount_mr_er_lit_mount_fail;
+        cmp r14, 13;                        // MR_RESULT_EFAULT
+        je mount_mr_er_lit_efault;
+        cmp r14, 14;                        // MR_RESULT_ENOSYS
+        je mount_mr_er_lit_enosys;
+        cmp r14, 15;                        // MR_RESULT_AUDIT_FAIL
+        je mount_mr_er_lit_audit_fail;
+        jmp mount_mr_er_lit_kernel_error;   // MR_RESULT_KERNEL_ERROR (3) or unrecognised
 
       mount_mr_er_lit_dry_run:
         lea rsi, [rip + mr_lit_result_dry_run];
@@ -511,6 +637,66 @@ module MountRecord = structure {
       mount_mr_er_lit_elevation:
         lea rsi, [rip + mr_lit_result_elevation];
         mov rdx, 18;                        // mr_lit_result_elevation_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_elevation_stub:
+        lea rsi, [rip + mr_lit_result_elevation_stub];
+        mov rdx, 14;                        // mr_lit_result_elevation_stub_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_invalid_mount_point:
+        lea rsi, [rip + mr_lit_result_invalid_mount_point];
+        mov rdx, 19;                        // mr_lit_result_invalid_mount_point_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_bad_volume_cap:
+        lea rsi, [rip + mr_lit_result_bad_volume_cap];
+        mov rdx, 14;                        // mr_lit_result_bad_volume_cap_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_narrow_failed:
+        lea rsi, [rip + mr_lit_result_narrow_failed];
+        mov rdx, 13;                        // mr_lit_result_narrow_failed_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_einval_backend:
+        lea rsi, [rip + mr_lit_result_einval_backend];
+        mov rdx, 14;                        // mr_lit_result_einval_backend_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_einval_mplen:
+        lea rsi, [rip + mr_lit_result_einval_mplen];
+        mov rdx, 13;                        // mr_lit_result_einval_mplen_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_einval_devlen:
+        lea rsi, [rip + mr_lit_result_einval_devlen];
+        mov rdx, 14;                        // mr_lit_result_einval_devlen_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_unimpl_backend:
+        lea rsi, [rip + mr_lit_result_unimpl_backend];
+        mov rdx, 14;                        // mr_lit_result_unimpl_backend_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_mount_fail:
+        lea rsi, [rip + mr_lit_result_mount_fail];
+        mov rdx, 10;                        // mr_lit_result_mount_fail_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_efault:
+        lea rsi, [rip + mr_lit_result_efault];
+        mov rdx, 6;                         // mr_lit_result_efault_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_enosys:
+        lea rsi, [rip + mr_lit_result_enosys];
+        mov rdx, 6;                         // mr_lit_result_enosys_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_audit_fail:
+        lea rsi, [rip + mr_lit_result_audit_fail];
+        mov rdx, 10;                        // mr_lit_result_audit_fail_len
         jmp mount_mr_er_lit_write;
 
       mount_mr_er_lit_kernel_error:
@@ -548,6 +734,98 @@ module MountRecord = structure {
         pop r13;
         pop r12;
         pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mount_record_classify_mount_errno(raw_errno) -> u64
+  //     (one of the MR_RESULT_* codes above -- see this module's own
+  //     header addendum for the full failure-taxonomy write-up)
+  //
+  //   rdi = raw_errno  (MountOp::mount_op_invoke's *out_raw_errno_ptr
+  //                      output on a MOUNT_OP_ERR_KERNEL return -- the
+  //                      real sys_mount syscall's raw rax value)
+  //
+  // Compares rdi against the seven known kernel-error sentinels (six
+  // real SYS_MOUNT_* errno constants plus raw -ENOSYS) and returns the
+  // matching MR_RESULT_* code, or MR_RESULT_KERNEL_ERROR (3) as the
+  // default for anything else. Every sentinel is staged into a register
+  // via a full 64-bit `mov` (MOVABS where the immediate exceeds the
+  // 32-bit sign-extend bound) before the compare -- `cmp reg, imm32`
+  // sign-extends its immediate, and several of these sentinels
+  // (0xFFFFED60..65) have bit 31 set, so a direct `cmp rdi, 0xFFFFED65`
+  // would compare against the WRONG 64-bit value
+  // (0xFFFFFFFFFFFFED65, not the intended zero-extended
+  // 0x00000000FFFFED65) -- the identical trap `src/volume_cap.pdx`'s own
+  // `volume_cap_resolve` already stages its VC_PARSE_ERR sentinel
+  // through a register to avoid.
+  //
+  // Pure leaf: rax/rdi/r10 are all SysV caller-save, no push/pop, no
+  // nested call.
+  // ==========================================================================
+  pub let mount_record_classify_mount_errno : (u64) -> u64 !{} @{} =
+    fn (raw_errno: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "mount.pdxfs.M3-004 (#10): mount_record_classify_mount_errno entry point. raw_errno arrives in rdi. Seven staged-register compares in a fixed order, each `mov r10, <sentinel>` (MOVABS where needed) then `cmp rdi, r10; je <label>`: 0xFFFFED60 (SYS_MOUNT_EINVAL_BACKEND) -> mount_mr_cme_einval_backend (rax=8); 0xFFFFED61 (SYS_MOUNT_EINVAL_MP_LEN) -> mount_mr_cme_einval_mplen (rax=9); 0xFFFFED62 (SYS_MOUNT_EINVAL_DEV_LEN) -> mount_mr_cme_einval_devlen (rax=10); 0xFFFFED63 (SYS_MOUNT_UNIMPL_PDXFS_BLOCK) -> mount_mr_cme_unimpl_backend (rax=11); 0xFFFFED64 (SYS_MOUNT_MOUNT_FAIL) -> mount_mr_cme_mount_fail (rax=12); 0xFFFFED65 (SYS_MOUNT_EFAULT) -> mount_mr_cme_efault (rax=13); 0xFFFFFFFFFFFFFFDA (-ENOSYS, the value dispatch_mount's still-unwired stub actually returns today per src/mount_op.pdx's own KERNEL GAP #1) -> mount_mr_cme_enosys (rax=14). Falling through all seven -> `mov rax, 3` (MR_RESULT_KERNEL_ERROR, the default/unrecognised-errno case). Every sentinel is staged via r10 rather than compared as a direct cmp-imm, per this function's own header note on the imm32 sign-extension trap. Pure leaf -- rax/rdi/r10 all SysV caller-save, no push/pop, no nested call. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mount_mr_cme_.",
+      block: {
+        mov r10, 0xFFFFED60;                // SYS_MOUNT_EINVAL_BACKEND
+        cmp rdi, r10;
+        je mount_mr_cme_einval_backend;
+
+        mov r10, 0xFFFFED61;                // SYS_MOUNT_EINVAL_MP_LEN
+        cmp rdi, r10;
+        je mount_mr_cme_einval_mplen;
+
+        mov r10, 0xFFFFED62;                // SYS_MOUNT_EINVAL_DEV_LEN
+        cmp rdi, r10;
+        je mount_mr_cme_einval_devlen;
+
+        mov r10, 0xFFFFED63;                // SYS_MOUNT_UNIMPL_PDXFS_BLOCK
+        cmp rdi, r10;
+        je mount_mr_cme_unimpl_backend;
+
+        mov r10, 0xFFFFED64;                // SYS_MOUNT_MOUNT_FAIL
+        cmp rdi, r10;
+        je mount_mr_cme_mount_fail;
+
+        mov r10, 0xFFFFED65;                // SYS_MOUNT_EFAULT
+        cmp rdi, r10;
+        je mount_mr_cme_efault;
+
+        mov r10, 0xFFFFFFFFFFFFFFDA;        // -ENOSYS
+        cmp rdi, r10;
+        je mount_mr_cme_enosys;
+
+        mov rax, 3;                         // MR_RESULT_KERNEL_ERROR (default)
+        ret;
+
+      mount_mr_cme_einval_backend:
+        mov rax, 8;                         // MR_RESULT_EINVAL_BACKEND
+        ret;
+
+      mount_mr_cme_einval_mplen:
+        mov rax, 9;                         // MR_RESULT_EINVAL_MP_LEN
+        ret;
+
+      mount_mr_cme_einval_devlen:
+        mov rax, 10;                        // MR_RESULT_EINVAL_DEV_LEN
+        ret;
+
+      mount_mr_cme_unimpl_backend:
+        mov rax, 11;                        // MR_RESULT_UNIMPL_BACKEND
+        ret;
+
+      mount_mr_cme_mount_fail:
+        mov rax, 12;                        // MR_RESULT_MOUNT_FAIL
+        ret;
+
+      mount_mr_cme_efault:
+        mov rax, 13;                        // MR_RESULT_EFAULT
+        ret;
+
+      mount_mr_cme_enosys:
+        mov rax, 14;                        // MR_RESULT_ENOSYS
         ret;
       }
     }

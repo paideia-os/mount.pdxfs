@@ -1,8 +1,8 @@
 # mount.pdxfs — status
 
 **Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M2 (core implementation) — **landed**
-**Version:** unreleased (pre-1.0.0)
+**Current milestone:** M5 (signed release) — **landed** (source-form scaffold)
+**Version:** 1.0.0
 
 See `design/tooling/volume-tooling-ux.md` §9.2 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -143,44 +143,130 @@ branch, issues the (currently `-ENOSYS`) syscall, and reports
 `result_code: KERNEL_ERROR` with exit 3 — this is the correct,
 documented M2 landing behaviour, not a defect in this repo.
 
-### M3 — Elevate + audit-first + semantic-pipe (pending)
+### M3 — Elevate + audit-first + semantic-pipe — **landed**
 
-- [ ] **M3-001** — mount-point-class table (§4.2) +
+- [x] **M3-001** — mount-point-class table (§4.2) +
       `libpdx-elevate` integration for `/system`, `/boot`, `/dev`,
-      cross-user. Replaces `src/elevate.pdx`'s M1 stub (`elevate_needed`
-      always returns "not required").
-- [ ] **M3-002** — INTENT record before `sys_mount` + RESULT record
-      after (shared `audit_id`).
-- [ ] **M3-003** — semantic-pipe: `PdxFsMountRecord@0.1` schema bind +
-      emit (full 10-field record, replacing M1's 4-field text line).
-- [ ] **M3-004** — failure-taxonomy encoding (§4.4): map every kernel
-      errno + policy-refusal to a distinct `result_code`.
+      cross-user: landed. `src/elevate.pdx`'s M2-003 `elevate_needed`
+      is kept, unmodified, no remaining caller; a new `Elevate::mount_
+      point_class` exposes the same three-prefix-group body under this
+      issue's own four-value vocabulary (`MPC_USER_SUBTREE`, `MPC_
+      SYSTEM_PATH`, `MPC_CROSS_USER` — defined, never actually produced,
+      no `KIND_USER` identity lookup exists to tell an own-subtree
+      `/home/` apart from another user's — `MPC_INVALID`). A full read
+      of `libpdx-elevate`'s real, mature source confirms the identical
+      "no broker-endpoint cap provisioned" gap `mkfs.pdxfs`'s own M3-005
+      (#12) already found over the SAME library: `Elevate::mount_elev_
+      require_system` is therefore a documented fail-closed stub —
+      `MOUNT_ELEV_DENY` unconditionally. `MOUNT_ELEV_GRANT` and its
+      dispatch arm are real, wired code, unreachable at this landing.
+- [x] **M3-002** — INTENT record before `sys_mount` + RESULT record
+      after (shared `audit_id`): landed. New `src/audit_wire.pdx`
+      (`AuditWire::mount_audit_begin` / `mount_audit_commit`), mirroring
+      mkfs.pdxfs's own `audit_wire.pdx` (M3-004, #11) shape exactly.
+      `audit_begin` is called once, before any dispatch, in `main.pdx`;
+      every terminal branch's own `audit_commit` call shares that ONE
+      `audit_id` — libpdx-audit's real correlation mechanism for the
+      INTENT/RESULT pairing this issue asks for (there is no separate
+      `parent_audit_id` parameter on the real `audit_commit`; that name
+      belongs to a different entry point, `audit_set_parent`, for
+      cross-process parent/child audit trees).
+- [x] **M3-003** — semantic-pipe: `PdxFsMountRecord@0.1` schema bind +
+      emit: landed as a documented DEFERRAL, matching mkfs.pdxfs's own
+      M3-003 (#10) finding over the identical `paideia-os#2000`
+      schema-registry gap (`Registry::bind_by_name` confirmed inert).
+      New `src/pipe_wire.pdx` — one wrapper (`PipeWire::mount_pipe_
+      emit_result`, not two like mkfs.pdxfs's own two-wrapper shape,
+      since this repo's M2 landing had already unified dry-run into the
+      same emitter as every other result code), prepending one
+      documented deferral header line before delegating to `MountRecord
+      ::mount_record_emit_result` unchanged.
+- [x] **M3-004** — failure-taxonomy encoding (§4.4): landed. `src/
+      mount_record.pdx` gains eleven new `MR_RESULT_*` codes (4..14): four
+      policy refusals this repo's own pipeline detects (`ELEVATION_
+      STUB`, `INVALID_MOUNT_POINT`, `BAD_VOLUME_CAP`, `NARROW_FAILED` —
+      all previously folded into the single M2 `KERNEL_ERROR` catch-all)
+      plus the seven real kernel-errno sentinels `sys_mount.pdx` can
+      return (six `SYS_MOUNT_*` constants at `0xFFFFED60..65`, plus raw
+      `-ENOSYS`), classified via a new pure-leaf `MountRecord::mount_
+      record_classify_mount_errno`. `src/mount_op.pdx`'s `mount_op_
+      invoke` grows a 5th out-param (`out_raw_errno_ptr`, staged into a
+      newly-pushed callee-save `r15` to survive the real-path syscall's
+      caller-save-zeroing hardening) to feed it. Given `dispatch_mount`
+      is still an unconditional `-ENOSYS` stub (`src/mount_op.pdx`'s own
+      KERNEL GAP #1, unchanged since M2), `MR_RESULT_ENOSYS` (14) is the
+      one real, observed outcome today for any non-dry-run invocation;
+      the other six `SYS_MOUNT_*` arms are real, wired, unreachable
+      until `dispatch_mount` is wired for real.
 
-### M4 — Tests + smoke (pending)
+`src/main.pdx`'s `_start` is rewritten to wire all six modules together:
+`r13` (dead `argv` after `argv_parse`) is reused to hold the shared
+`audit_id` for the rest of the function — the identical register-reuse
+trick mkfs.pdxfs's own M3 `main.pdx` applies to its `r12`. The M2-era
+single shared `mount_main_kernel_error` label is gone, replaced by one
+small, distinct emit-commit-exit block per failure cause.
 
-- [ ] **M4-001** — happy-path smoke: `/mnt` user-owned mount, no
-      elevate.
-- [ ] **M4-002** — elevate-required smoke: `/system` mount with
-      auto-approve policy + human-approve fallback.
-- [ ] **M4-003** — failure-matrix smoke: sig-invalid, journal-corrupt,
-      already-mounted, mount-point-exists, no-permission.
-- [ ] **M4-004** — elevate-timeout path: request times out (30s
-      default) → exit 4 with clean audit trail.
+### M4 — Tests + smoke — **landed**
 
-### M5 — Signed release (pending)
+- [x] **M4-001** — happy-path smoke: `/mnt` user-owned mount, no
+      elevate: landed. `tests/test_happy_mnt.pdx` drives `Argv::argv_
+      parse` → `Elevate::mount_point_class` → `VolumeCap::volume_cap_
+      resolve` → `MountOp::mount_op_invoke` for a real (non-`--dry-run`)
+      `cap:volume:0x42` / `/mnt/user` invocation, accepting either
+      `MOUNT_OP_OK` or a `MOUNT_OP_ERR_KERNEL` that classifies to `MR_
+      RESULT_ENOSYS` — a strictly more precise assertion than a bare
+      "or KERNEL_ERROR", since M3-004 gave ENOSYS its own code.
+- [x] **M4-002** — elevate-required smoke: `/system` mount: landed.
+      `tests/test_elevate_system.pdx` asserts `mount_point_class`
+      returns `MPC_SYSTEM_PATH` and `mount_elev_require_system` returns
+      `MOUNT_ELEV_DENY` for `/system/foo` — the `result_code: ELEVATION_
+      STUB` outcome this landing's fail-closed posture actually
+      produces, per this issue's own "or ELEVATION_STUB" allowance.
+- [x] **M4-003** — failure-matrix smoke: landed (adapted to this repo's
+      own failure surface — sig-invalid / journal-corrupt / already-
+      mounted have no `mount.pdxfs`-side analogue at this landing; the
+      four cases below are the real, reachable failure modes this
+      repo's own M3-004 taxonomy actually distinguishes).
+      `tests/test_failure_matrix.pdx` drives four cases against four
+      DISTINCT `MR_RESULT_*` codes: a malformed volume-cap hex tail
+      (`BAD_VOLUME_CAP`), an unrecognised mount-point prefix (`INVALID_
+      MOUNT_POINT`), a `/system/**` path (`ELEVATION_STUB`), and a
+      well-formed real-mount attempt against the still-unwired kernel
+      (`ENOSYS`).
+- [x] **M4-004** — elevate-timeout path: landed as a documented STUB per
+      this issue's own instruction. `tests/test_elevate_timeout.pdx`
+      always returns a `TET_DEFERRED` sentinel (deliberately distinct
+      from the `0` "passed" value) — no code path in this repo ever
+      dispatches a real `elevate_client_acquire`/`_request_ex` call (see
+      M3-001's fail-closed stub above), so there is no timeout scenario
+      to construct yet; `libpdx-elevate`'s own real bounded-poll timeout
+      machinery is mature and unaffected.
 
-- [ ] **M5-001** — dual-signed `manifest.pdxsig` + CHANGELOG-1.0 +
-      `.pdxdoc` for `doc mount.pdxfs`.
-- [ ] **M5-002** — mirror push to `pkgs.paideia-os`.
+### M5 — Signed release — **landed** (source-form scaffold)
+
+- [x] **M5-001** — dual-signed `manifest.pdxsig` + CHANGELOG-1.0 +
+      `.pdxdoc` for `doc mount.pdxfs`: landed. `CHANGELOG.md` (new,
+      `## 1.0.0` entry), `doc/mount.pdxfs.pdxdoc` (new, source form),
+      `release/manifest.pdxsig.txt` (new, every hash and signature slot
+      a documented placeholder — no live release-line key material in
+      this repo, mirroring `libpdx-volume`'s own M5-001 posture exactly),
+      `release/RELEASE-1.0.0.md` (new, operator runbook + release note,
+      mirroring `libpdx-volume`'s own `RELEASE-1.0.0.md` shape).
+- [x] **M5-002** — mirror push to `pkgs.paideia-os`: documented in
+      `release/RELEASE-1.0.0.md`'s own Distribution section as a
+      NOT-PERFORMED step (the mirror endpoint does not exist as of this
+      landing, same status every other satellite repo's own release
+      note carries) — no real mirror push happens in this repo.
 
 ## Next milestone
 
-M3 (elevate + audit-first + semantic-pipe) opens once the M2-002 kernel
-gaps above are resolved enough for a real end-to-end mount, OR M3's own
-scope (elevate round-trip, INTENT/RESULT audit pair, semantic-pipe
-framing, failure-taxonomy encoding) is judged independently landable
-against the current `KERNEL_ERROR` stub path — confirm with osarch.
-Three concrete asks carried forward from M2:
+None currently scoped past M5. `mount.pdxfs` v1.0.0's real, end-to-end
+mount path remains blocked on the three kernel-side gaps `src/mount_op.
+pdx` and `src/elevate.pdx` each document in full (`dispatch_mount`'s
+unwired stub, the two-incompatible-ABI question, `KIND_PDXFS_MOUNT_
+TABLE`'s unwired `APPEND_ROW`, and `libpdx-elevate`'s unprovisioned
+broker-endpoint cap) — none of which is this repo's own milestone to
+close. Three concrete asks carried forward from M2, unchanged:
 
 1. Which ABI sysno 75 (`sys_mount`) should grow into: the cap-slot
    contract `dispatch.pdx`'s own forward-declaration comment documents,
@@ -192,10 +278,15 @@ Three concrete asks carried forward from M2:
    ordinal 2) for real, and establish an `_init_caps`-style convention
    for seeding a standalone CLI tool (not just a long-running IPC
    server) with a cap slot for that kind.
+4. Provision `mount.pdxfs` with a real `KIND_ELEVATE_CHANNEL`
+   broker-endpoint cap (the `parent_ep_slot` `libpdx-elevate`'s own
+   README says is the caller's responsibility) so `src/elevate.pdx`'s
+   `mount_elev_require_system` can grow a real `elevate_client_acquire`
+   body — carried forward from M3-001, new at this landing.
 
 The `KIND_VOLUME` op-catalog gap flagged in `caps.decl` (no
 `VOL_OP_MOUNT` ordinal) and the missing `cap_check_kind` primitive
-(`src/volume_cap.pdx`'s own header) remain open alongside these three.
+(`src/volume_cap.pdx`'s own header) remain open alongside these four.
 
 ## Upstream design
 

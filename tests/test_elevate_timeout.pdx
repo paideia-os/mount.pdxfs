@@ -1,0 +1,90 @@
+// tests/test_elevate_timeout.pdx — mount.pdxfs.M4-004 (issue #14) —
+// TestElevateTimeout: elevate-timeout path — STUB.
+//
+// ================================================================
+// Why this is a deferral stub, not a real timeout test
+// ================================================================
+//
+// This issue's own acceptance text asks for a scenario where "the
+// elevate request times out (30s default) -> exit 4 with clean audit
+// trail". `libpdx-elevate`'s real timeout machinery IS mature and real
+// (`ElevateClientSend::elevate_client_recv_reply`'s bounded poll against
+// an `hpet_now_ns` deadline; `elevate_client_get_human_timeout` /
+// `_get_fast_timeout` default to 30s / 500ms respectively) -- but
+// nothing in THIS repo ever reaches it. `src/elevate.pdx`'s M3-001
+// (#7) landing is a documented FAIL-CLOSED STUB: `Elevate::mount_elev_
+// require_system` returns `MOUNT_ELEV_DENY` unconditionally, without
+// ever constructing a `mint_ctx_buf`, resolving `svc.elevate-broker`,
+// or issuing an `elevate_client_acquire` / `elevate_client_request_ex`
+// call of any kind -- see that file's own module header for the full
+// "no broker-endpoint cap provisioned" write-up. There is therefore NO
+// code path anywhere in `mount.pdxfs` that could ever time out: a
+// timeout can only happen to a REQUEST THAT WAS SENT, and this repo
+// never sends one.
+//
+// Per this issue's own instruction ("STUB — libpdx-elevate has no wired
+// timeout at M4. Test file emits deferral note"), `run()` below performs
+// NO assertion and always returns the `TET_DEFERRED` sentinel --
+// deliberately NOT `0` (this repo's own "all passed" value), so a
+// future test harness walking every driver's return code cannot mistake
+// "there was nothing here to test yet" for "tested and passed" without
+// reading this file's own header, matching this repo's own convention
+// of a driver's return value being self-describing (see tests/
+// README.md).
+//
+// ================================================================
+// What would need to land before this test can become real
+// ================================================================
+//
+//   1. `mount.pdxfs` needs an actual `KIND_ELEVATE_CHANNEL` broker-
+//      endpoint cap -- `caps.decl`'s own M1 note ("declared as a
+//      PLACEHOLDER only ... no code path in ANY landing of this repo
+//      has ever bound a real broker-endpoint cap") is still true as of
+//      this M4 landing.
+//   2. `src/elevate.pdx`'s `mount_elev_require_system` needs a real
+//      body calling `ElevateClientAcquire::elevate_client_acquire` (or
+//      the lower-level `ElevateClientSend::elevate_client_request_ex`)
+//      against that cap.
+//   3. ONLY THEN does a genuine timeout scenario exist to construct: a
+//      driver that stubs/fakes the broker's reply channel to never
+//      respond, and asserts the real bounded-poll deadline in `elevate_
+//      client_recv_reply` actually expires and surfaces `ELVC_ERR_
+//      TIMEOUT` (or whatever this repo's own real wrapper then maps it
+//      to) as `result_code` with exit 4.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No branch in this file's one function -- nothing to label, no
+//     encoder-gap surface to speak of.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.3 (mount.pdxfs#14);
+// src/elevate.pdx (this repo, M3-001, #7 -- the fail-closed posture that
+// makes this test currently unconstructable); paideia-satellites/
+// libpdx-elevate (the real, mature timeout machinery this repo does not
+// yet reach); tests/README.md (return-code convention).
+
+module TestElevateTimeout = structure {
+
+  // Deliberately distinct from 0 (this repo's own "all passed" value)
+  // -- see module header.
+  pub let TET_DEFERRED : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // run() -> u64
+  //
+  // Always returns TET_DEFERRED. See module header for the full
+  // deferral rationale and what must land before this becomes a real
+  // test.
+  // ==========================================================================
+  pub let run : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "mount.pdxfs.M4-004 (#14): TestElevateTimeout::run entry point. `mov rax, 0xFFFFFFFFFFFFFFFF` (TET_DEFERRED, MOVABS-loaded per this codebase's own all-ones-sentinel precedent -- e.g. VolumeCap::VC_PARSE_ERR); `ret`. No dereference, no branch, no nested call -- see module header for why: no code path in this repo ever dispatches a real elevate request, so there is nothing to time out yet.",
+      block: {
+        mov rax, 0xFFFFFFFFFFFFFFFF;         // TET_DEFERRED
+        ret;
+      }
+    }
+}

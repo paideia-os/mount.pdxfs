@@ -223,7 +223,8 @@ module MountOp = structure {
 
   // ==========================================================================
   // mount_op_invoke(narrowed_volume_slot, mount_point_ptr, flags,
-  //                  out_mount_id_ptr) -> u64 (MOUNT_OP_OK | MOUNT_OP_ERR_KERNEL)
+  //                  out_mount_id_ptr, out_raw_errno_ptr) -> u64
+  //     (MOUNT_OP_OK | MOUNT_OP_ERR_KERNEL)
   //
   //   rdi = narrowed_volume_slot (from VolumeCap::volume_cap_resolve)
   //   rsi = mount_point_ptr      (NUL-terminated <mount-point> string)
@@ -232,6 +233,17 @@ module MountOp = structure {
   //                               0 on the dry-run path or any kernel
   //                               error, the syscall's rax on a
   //                               plausible-looking success)
+  //   r8  = out_raw_errno_ptr    (u64 write target, NEW at M3-004 (#10);
+  //                               always written -- 0 on the dry-run
+  //                               path or a plausible-looking success,
+  //                               the RAW syscall return value (the
+  //                               actual kernel errno bit pattern, e.g.
+  //                               -ENOSYS today) on MOUNT_OP_ERR_KERNEL.
+  //                               main.pdx feeds this to MountRecord::
+  //                               mount_record_classify_mount_errno to
+  //                               pick a distinct failure-taxonomy
+  //                               result_code instead of the old generic
+  //                               MOUNT_OP_ERR_KERNEL catch-all)
   //
   // See module header for the full gap #1/#2/#3 write-up this function
   // embodies. Register plan (all SysV callee-save; pushed on entry,
@@ -240,21 +252,29 @@ module MountOp = structure {
   //   r12 = mount_point_ptr
   //   r13 = flags
   //   r14 = out_mount_id_ptr
+  //   r15 = out_raw_errno_ptr (NEW at M3-004 -- staged into a callee-save
+  //         register, not left in r8, because the real-path `syscall`
+  //         below is subject to the kernel's #743 info-leak hardening,
+  //         which zeroes every CALLER-save register -- r8 included --
+  //         before every sysret; leaving out_raw_errno_ptr in r8 across
+  //         that syscall would silently lose it)
   // ==========================================================================
-  pub let mount_op_invoke : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
-    fn (narrowed_volume_slot: u64) (mount_point_ptr: u64) (flags: u64) (out_mount_id_ptr: u64) -> unsafe {
+  pub let mount_op_invoke : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
+    fn (narrowed_volume_slot: u64) (mount_point_ptr: u64) (flags: u64) (out_mount_id_ptr: u64) (out_raw_errno_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs, cap},
-      justification: "mount.pdxfs.M2-002 (#5): mount_op_invoke entry point. SysV callee-save discipline: push rbx/r12/r13/r14 (4 registers, 32 bytes) before repurposing any of them -- popped in reverse order immediately before every return. rbx=narrowed_volume_slot, r12=mount_point_ptr, r13=flags, r14=out_mount_id_ptr, all now-saved callee-save registers surviving the nested `call mount_op_append_row` and every `syscall` (SYSCALL preserves callee-save registers per amd64 fast-syscall convention). Gate: `mov rax, r13; and rax, 0x8 (MOUNT_OP_FLAG_DRY_RUN); cmp rax, 0; jne mount_op_dry_run`. Dry-run arm: `xor rax,rax; mov [r14+0], rax` (mount_id=0, staged through a register rather than a bare imm-to-mem store for width-safety, matching this file's own zero-fill idiom elsewhere), `xor rax, rax` (MOUNT_OP_OK), jmp epilogue -- NO syscall issued, matching this issue's own '--dry-run skips the actual syscall' instruction. Real-mount arm: issues the ASPIRATIONAL cap-slot ABI documented in the module header directly as a raw syscall -- `mov rdi, rbx (narrowed_volume_slot); mov rsi, r12 (mount_point_ptr); mov rdx, r13 (flags); mov r10, 5 (MOUNT_OP_BACKEND_PDXFS_BLOCK); mov rax, 75 (MOUNT_OP_SC_MOUNT); syscall`. Classifies the return via the MOUNT_OP_ID_CEILING sanity band rather than matching a specific errno bit pattern (module header explains why): `mov r11, 65536; cmp rax, r11; jae mount_op_kernel_error`. On a plausible-looking success (rax < 65536): `mov r13, rax` stashes mount_id into r13 (flags is dead past this point, safely repurposed as the surviving callee-save slot mount_op_append_row's own nested call needs) BEFORE calling mount_op_append_row, since that call clobbers rax (caller-save, per its own justification); `mov rdi, r13; call mount_op_append_row` (result discarded per that function's own header); `mov [r14+0], r13` (write mount_id out); `xor rax, rax` (MOUNT_OP_OK); jmp epilogue. mount_op_kernel_error: `xor r10, r10; mov [r14+0], r10` (mount_id=0 on any kernel error), `mov rax, 1` (MOUNT_OP_ERR_KERNEL). Epilogue pops r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` anywhere (every memory write is a plain `mov [reg+0], reg` store, never an add). No `test` mnemonic. Labels prefixed mount_op_.",
+      justification: "mount.pdxfs.M2-002 (#5) + M3-004 (#10): mount_op_invoke entry point. SysV callee-save discipline: push rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any of them -- popped in reverse order immediately before every return. rbx=narrowed_volume_slot, r12=mount_point_ptr, r13=flags, r14=out_mount_id_ptr, r15=out_raw_errno_ptr (NEW), all now-saved callee-save registers surviving the nested `call mount_op_append_row` and every `syscall` (SYSCALL preserves callee-save registers per amd64 fast-syscall convention; r15 specifically MUST be callee-save here, not left in the caller-save r8 it arrived in, since the kernel's #743 info-leak hardening zeroes every caller-save register including r8 before every sysret -- see this function's own register-plan comment). Gate: `mov rax, r13; and rax, 0x8 (MOUNT_OP_FLAG_DRY_RUN); cmp rax, 0; jne mount_op_dry_run`. Dry-run arm: `xor rax,rax; mov [r14+0], rax` (mount_id=0), `mov [r15+0], rax` (raw_errno=0, NEW), `xor rax, rax` (MOUNT_OP_OK), jmp epilogue -- NO syscall issued, matching this issue's own '--dry-run skips the actual syscall' instruction. Real-mount arm: issues the ASPIRATIONAL cap-slot ABI documented in the module header directly as a raw syscall -- `mov rdi, rbx (narrowed_volume_slot); mov rsi, r12 (mount_point_ptr); mov rdx, r13 (flags); mov r10, 5 (MOUNT_OP_BACKEND_PDXFS_BLOCK); mov rax, 75 (MOUNT_OP_SC_MOUNT); syscall`. Classifies the return via the MOUNT_OP_ID_CEILING sanity band rather than matching a specific errno bit pattern (module header explains why): `mov r11, 65536; cmp rax, r11; jae mount_op_kernel_error` -- rax (the raw syscall return) is UNTOUCHED by this compare, so it is still available verbatim at mount_op_kernel_error. On a plausible-looking success (rax < 65536): `xor r10, r10; mov [r15+0], r10` (raw_errno=0 on success, NEW) BEFORE `mov r13, rax` stashes mount_id into r13 (flags is dead past this point, safely repurposed as the surviving callee-save slot mount_op_append_row's own nested call needs); `mov rdi, r13; call mount_op_append_row` (result discarded per that function's own header); `mov [r14+0], r13` (write mount_id out); `xor rax, rax` (MOUNT_OP_OK); jmp epilogue. mount_op_kernel_error (NEW at M3-004): FIRST `mov [r15+0], rax` -- captures the raw syscall return verbatim into *out_raw_errno_ptr BEFORE rax is clobbered by anything else -- THEN `xor r10, r10; mov [r14+0], r10` (mount_id=0 on any kernel error), `mov rax, 1` (MOUNT_OP_ERR_KERNEL). Epilogue pops r15/r14/r13/r12/rbx (reverse push order) then returns. No `add reg,[mem]` anywhere (every memory write is a plain `mov [reg+0], reg` store, never an add). No `test` mnemonic. Labels prefixed mount_op_.",
       block: {
         push rbx;
         push r12;
         push r13;
         push r14;
+        push r15;
 
         mov rbx, rdi;                        // rbx = narrowed_volume_slot
         mov r12, rsi;                        // r12 = mount_point_ptr
         mov r13, rdx;                        // r13 = flags
         mov r14, rcx;                        // r14 = out_mount_id_ptr
+        mov r15, r8;                         // r15 = out_raw_errno_ptr
 
         // ---- Gate: --dry-run? (MOUNT_OP_FLAG_DRY_RUN = 0x8) ----------------
         mov rax, r13;
@@ -275,6 +295,8 @@ module MountOp = structure {
         jae mount_op_kernel_error;
 
         // ---- Plausible-looking success: best-effort append-row. -----------
+        xor r10, r10;
+        mov [r15 + 0], r10;                  // *out_raw_errno_ptr = 0 (success)
         mov r13, rax;                        // r13 = mount_id (flags is dead here)
         mov rdi, r13;
         call mount_op_append_row;            // result discarded (see header)
@@ -286,15 +308,18 @@ module MountOp = structure {
       mount_op_dry_run:
         xor rax, rax;
         mov [r14 + 0], rax;                  // *out_mount_id_ptr = 0
+        mov [r15 + 0], rax;                  // *out_raw_errno_ptr = 0
         xor rax, rax;                        // MOUNT_OP_OK
         jmp mount_op_done;
 
       mount_op_kernel_error:
+        mov [r15 + 0], rax;                  // *out_raw_errno_ptr = raw syscall return (NEW)
         xor r10, r10;
         mov [r14 + 0], r10;                  // *out_mount_id_ptr = 0
         mov rax, 1;                          // MOUNT_OP_ERR_KERNEL
 
       mount_op_done:
+        pop r15;
         pop r14;
         pop r13;
         pop r12;

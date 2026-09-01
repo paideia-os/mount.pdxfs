@@ -389,3 +389,129 @@ at segment 8; `mount_id` prints only on `MR_RESULT_OK`. A shared
 digit-conversion loop byte-for-byte, backs both the `flags` field
 (present since M1) and the new `mount_id` field so the div-by-10 loop
 exists exactly once in this file.
+
+## 11. M3 landing — real classifier + elevate stub, audit-first, semantic-pipe deferral, failure taxonomy
+
+M3 (issues #7, #8, #9, #10) replaces M2's narrow three-bucket elevate
+classifier and single `KERNEL_ERROR` catch-all with a real four-class
+`§4.2` mount-point table (still fail-closed at the broker hop), a real
+libpdx-audit INTENT/RESULT wrap sharing one `audit_id`, a documented
+semantic-pipe deferral (mirroring mkfs.pdxfs's own M3-003 finding
+byte-for-byte), and an eleven-code failure taxonomy sourced directly
+from `sys_mount.pdx`'s real errno set. Two new files (`src/audit_wire.
+pdx`, `src/pipe_wire.pdx`), three files extended in place (`src/
+elevate.pdx`, `src/mount_record.pdx`, `src/mount_op.pdx`), and `src/
+main.pdx`'s `_start` rewritten to wire all six modules together.
+
+### 11.1 `elevate.pdx` — real four-class table, fail-closed libpdx-elevate stub
+
+`Elevate::mount_point_class(mount_point_ptr) -> u64` replaces main.pdx's
+M2 call site to `elevate_needed` (kept, unmodified, no remaining
+caller) with a §4.2-matching four-value vocabulary: `MPC_USER_SUBTREE`
+(0), `MPC_SYSTEM_PATH` (1), `MPC_CROSS_USER` (2, defined but never
+actually produced — see below), `MPC_INVALID` (3). The body is
+byte-for-byte the same three-prefix-group logic `elevate_needed`
+already had; only the return-value NAMES changed to this issue's own
+class vocabulary, so `MPC_SYSTEM_PATH` and `MPC_CROSS_USER` can be
+treated identically by main.pdx's dispatch (both "need elevate") even
+though this landing's classifier structurally cannot yet tell them
+apart — doing so needs the invoker's own `KIND_USER` identity, which
+this tool has never had at any landing (M2-003's own header flagged
+this gap for "M3-001 to close"; it remains open).
+
+`Elevate::mount_elev_require_system(mount_point_ptr, mpc_class) -> u64`
+is the new libpdx-elevate call site this issue asks for. A full read of
+`libpdx-elevate`'s real, mature (v1.1.0-in-progress) source confirms the
+identical gap `mkfs.pdxfs`'s own `src/elevate_wire.pdx` (M3-005, #12)
+already documented over the SAME library: `ElevateClientAcquire::
+elevate_client_acquire` requires a `KIND_IPC_ENDPOINT` cap over
+`svc.elevate-broker` at its `mint_ctx_buf.parent_ep_slot` field, a
+prerequisite libpdx-elevate's own README says is "declared by whatever
+the caller links this library into" — and `caps.decl`'s own
+`KIND_ELEVATE_CHANNEL = 0x191` has been a PLACEHOLDER since M1, unchanged
+by any landing including this one. `mount_elev_require_system` is
+therefore a documented fail-closed stub: `MOUNT_ELEV_DENY` (0)
+unconditionally. `MOUNT_ELEV_GRANT` (1) and the GRANT arm of main.pdx's
+dispatch are real, wired code kept for the day a broker-endpoint cap
+exists.
+
+### 11.2 `audit_wire.pdx` — real INTENT/RESULT pair, one shared audit_id
+
+New file, mirroring `mkfs.pdxfs`'s own `audit_wire.pdx` (M3-004, #11)
+shape exactly: `AuditWire::mount_audit_begin(mount_point_ptr, dry_run_
+flag) -> audit_id` (real `AuditClient::audit_begin` call, op_name
+selected between `"mount.pdxfs.mount"` / `"mount.pdxfs.mount.dry_run"`
+by the caller's own flag) and `AuditWire::mount_audit_commit(audit_id,
+exit_code) -> ()` (real `AuditClient::audit_commit`, skipped entirely
+when `audit_id == 0`). `main.pdx` calls `mount_audit_begin` once, right
+after argv parses, BEFORE any dispatch — every terminal branch
+therefore gets the same audit wrapping, and every branch's own `call
+mount_audit_commit` shares that ONE `audit_id`, which is this issue's
+own "shared audit_id" requirement. `audit_commit`'s real signature has
+no `parent_audit_id` parameter (that name belongs to a DIFFERENT entry
+point, `audit_set_parent`, meant for cross-process parent/child audit
+trees, not this issue's INTENT/RESULT pairing) — the shared `audit_id`
+itself, round-tripped through `audit_begin` then `audit_commit`, is
+libpdx-audit's own real correlation mechanism for exactly this need.
+
+### 11.3 `pipe_wire.pdx` — one wrapper, not two, over the same deferred registry
+
+New file, mirroring `mkfs.pdxfs`'s own `pipe_wire.pdx` (M3-003, #10)
+finding over the SAME schema-registry gap (`paideia-os#2000`,
+`Registry::bind_by_name` confirmed inert): `PipeWire::mount_pipe_emit_
+result` prints one documented deferral header line then delegates all
+five arguments to `MountRecord::mount_record_emit_result`. Unlike
+mkfs.pdxfs (which still carries two wrappers, a leftover of its own M1/
+M2 emitter split), mount.pdxfs's M2 landing had already unified its
+record emission into ONE function (`mount_record_emit_result`, dry-run
+included as just another `result_code` value) — so this file needs
+only ONE wrapper. `main.pdx` calls this one wrapper on every terminal
+path; no code path calls `MountRecord::mount_record_emit_result`
+directly any more.
+
+### 11.4 `mount_record.pdx` / `mount_op.pdx` — the failure taxonomy
+
+`src/mount_record.pdx` gains eleven new `MR_RESULT_*` codes (4..14) and
+a new pure-leaf classifier, `MountRecord::mount_record_classify_mount_
+errno(raw_errno) -> u64`. Four codes are policy refusals this repo's
+own pipeline already detects (`ELEVATION_STUB`, `INVALID_MOUNT_POINT`,
+`BAD_VOLUME_CAP`, `NARROW_FAILED`) — previously all folded into the
+single M2 `KERNEL_ERROR` catch-all, now each its own code, wired
+directly into `main.pdx`'s own dispatch. Seven more come from `sys_
+mount.pdx`'s real, kernel-landed errno set (`grep -n "pub let SYS_
+MOUNT_" src/kernel/core/syscall/sys_mount.pdx`, six sentinels
+`0xFFFFED60..65`) plus raw `-ENOSYS` — `mount_record_classify_mount_
+errno` compares a captured raw syscall return against all seven via
+register-staged 64-bit compares (the same imm32-sign-extension trap
+`VolumeCap::volume_cap_resolve`'s own `VC_PARSE_ERR` check already
+avoids), falling back to the original `KERNEL_ERROR` (3) for anything
+unrecognised. `MR_RESULT_AUDIT_FAIL` (15) is reserved, unused by any
+M3 call site, mirroring mkfs.pdxfs's own `FR_RESULT_AUDIT_FAIL`.
+
+`src/mount_op.pdx`'s `MountOp::mount_op_invoke` grows a 5th parameter,
+`out_raw_errno_ptr`, staged into the newly-pushed callee-save `r15`
+(NOT left in the caller-save `r8` it arrives in, since the real-path
+`syscall` is subject to the kernel's #743 caller-save-zeroing hardening)
+— written `0` on the dry-run/success paths, the raw syscall return
+verbatim on `MOUNT_OP_ERR_KERNEL`. Given `dispatch_mount` is still an
+unconditional `-ENOSYS` stub (`src/mount_op.pdx`'s own KERNEL GAP #1,
+unchanged since M2), `mount_record_classify_mount_errno` observes
+exactly ONE real value today — `MR_RESULT_ENOSYS` (14) — for every
+non-dry-run invocation; the other six `SYS_MOUNT_*` classification arms
+are real, wired code kept ready for the day `dispatch_mount` is wired
+for real.
+
+### 11.5 `main.pdx` — six-module dispatch, one shared audit_id, per-cause result codes
+
+`_start`'s register plan reuses `r13` (dead `argv` after `argv_parse`)
+to hold the `audit_id` for the rest of the function, the identical
+reuse trick `mkfs.pdxfs`'s own M3 `main.pdx` applies to its `r12`.
+Every terminal branch (`MPC_INVALID`, the elevate-stub DENY, `VC_ERR_
+BAD_URI`, `VC_ERR_NARROW_FAILED`, every `mount_record_classify_mount_
+errno` outcome, and both success sub-branches) follows the identical
+three-step shape: emit via `pipe_wire.pdx`, commit via `audit_wire.pdx`
+sharing the one `audit_id`, `sys_exit` the real status. The M2-era
+single shared `mount_main_kernel_error` label is gone entirely —
+replaced by one small, distinct block per failure cause, each choosing
+its own `MR_RESULT_*` code rather than funnelling through one generic
+catch-all.

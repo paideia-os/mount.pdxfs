@@ -1,0 +1,167 @@
+// tests/test_failure_matrix.pdx — mount.pdxfs.M4-003 (issue #13)
+// TestFailureMatrix: four deliberately-invalid or elevate/kernel-gated
+// inputs, each asserted against a DIFFERENT MR_RESULT_* code the real
+// M3 pipeline (src/main.pdx) would select for it.
+//
+// ================================================================
+// Why these four cases, and why each is driven at the FUNCTION level
+// rather than through a full argv_parse round trip
+// ================================================================
+//
+// This issue's own acceptance text asks for "several deliberately-
+// invalid inputs (bad cap, bad path, ...), assert distinct MR_RESULT_*
+// per case". Each case below calls the SAME real, linked entry point
+// `src/main.pdx`'s own dispatch would call for that failure mode
+// directly on a hand-written string, rather than re-parsing a synthetic
+// argv array first (as `test_happy_mnt.pdx` / `test_elevate_system.pdx`
+// do) -- `Argv::argv_parse` itself is exercised by both of THOSE
+// drivers already; this driver's own job is the failure-taxonomy
+// DISPATCH mapping (src/mount_record.pdx's #10 extension), which is
+// exactly as well exercised calling `VolumeCap::volume_cap_resolve` /
+// `Elevate::mount_point_class` / `Elevate::mount_elev_require_system` /
+// `MountOp::mount_op_invoke` / `MountRecord::mount_record_classify_
+// mount_errno` directly on a fixed string as it would be re-deriving
+// that same string from an argv round trip first.
+//
+//   Case 1 -- a malformed `<volume-cap>` hex tail ("cap:volume:0xZZ" --
+//             'Z' fails every one of VolumeCap::volume_cap_parse_slot's
+//             three hex-digit bands) -> VolumeCap::VC_ERR_BAD_URI (1),
+//             which main.pdx's own dispatch maps to result_code MR_
+//             RESULT_BAD_VOLUME_CAP (6).
+//   Case 2 -- a mount point matching none of the six known prefixes
+//             ("/etc/foo") -> Elevate::MPC_INVALID (3), which main.pdx
+//             maps to result_code MR_RESULT_INVALID_MOUNT_POINT (5).
+//   Case 3 -- a `/system/**` mount point ("/system/bar") ->
+//             Elevate::MPC_SYSTEM_PATH (1), then Elevate::mount_elev_
+//             require_system's fail-closed MOUNT_ELEV_DENY (0), which
+//             main.pdx maps to result_code MR_RESULT_ELEVATION_STUB (4)
+//             -- see src/elevate.pdx's own module header for the full
+//             write-up.
+//   Case 4 -- a well-formed real-mount attempt against the still-
+//             unwired kernel ("cap:volume:0x7" resolving via VC_OK,
+//             "/mnt/z" as the mount point, no `--dry-run`) ->
+//             MountOp::MOUNT_OP_ERR_KERNEL, whose captured raw errno
+//             classifies to MR_RESULT_ENOSYS (14) via MountRecord::
+//             mount_record_classify_mount_errno -- the real, observed
+//             outcome today per src/mount_op.pdx's own KERNEL GAP #1.
+//
+// Four DISTINCT codes (6, 5, 4, 14), each reached through the real,
+// linked pipeline function that would produce it -- no fabricated
+// short-circuit anywhere in this driver.
+//
+// ================================================================
+// Return-code convention (matches tests/README.md)
+// ================================================================
+//
+//   0     -- all four cases passed.
+//   1..4  -- the 1-based ordinal of the first case that failed.
+//
+// ================================================================
+// paideia-as encoder notes
+// ================================================================
+//   - No `@no_frame` anywhere.
+//   - No `add reg, [mem]` anywhere.
+//   - No `test` mnemonic; every check is `cmp`.
+//   - Cross-module calls use the bare unqualified symbol name, per this
+//     repo's established convention -- unresolved-external references
+//     in this file's own `.o`, same as every other driver in this
+//     directory.
+//   - Each case is a flat, independent block in `run()` with no
+//     register needing to survive across a call FROM run() itself
+//     (every call's result is checked and dispatched immediately) --
+//     deliberately avoiding a callee-save push/pop dance, matching
+//     libpdx-volume's own `TestMountTableSnapshot::run` discipline for
+//     its own four-case matrix.
+//   - Label prefix `mount_test_`.
+//
+// Upstream: design/tooling/volume-tooling-ux.md §9.3 (mount.pdxfs#13);
+// src/mount_record.pdx (this repo, M3-004, #10 -- the failure taxonomy
+// this driver exercises); tests/README.md (return-code convention).
+
+module TestFailureMatrix = structure {
+
+  pub let tfm_lit_bad_cap      : [u8; 16] = "cap:volume:0xZZ\0"
+  pub let tfm_lit_invalid_mp   : [u8; 9]  = "/etc/foo\0"
+  pub let tfm_lit_system_mp    : [u8; 12] = "/system/bar\0"
+  pub let tfm_lit_good_cap     : [u8; 15] = "cap:volume:0x7\0"
+  pub let tfm_lit_user_mp      : [u8; 7]  = "/mnt/z\0"
+
+  pub let mut tfm_narrowed  : u64 = uninit @align(8)
+  pub let mut tfm_mount_id  : u64 = uninit @align(8)
+  pub let mut tfm_raw_errno : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // run() -> u64
+  // ==========================================================================
+  pub let run : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M4-003 (#13): TestFailureMatrix::run entry point. Case 1: rdi=&tfm_lit_bad_cap, rsi=&tfm_narrowed, call volume_cap_resolve; `cmp rax,1; jne mount_test_tfm_case1_fail` (VC_ERR_BAD_URI expected -> MR_RESULT_BAD_VOLUME_CAP=6 in main.pdx's own mapping, return 1 on mismatch). Case 2: rdi=&tfm_lit_invalid_mp, call mount_point_class; `cmp rax,3; jne mount_test_tfm_case2_fail` (MPC_INVALID expected -> MR_RESULT_INVALID_MOUNT_POINT=5, return 2). Case 3: rdi=&tfm_lit_system_mp, call mount_point_class; `cmp rax,1; jne mount_test_tfm_case3_fail` (MPC_SYSTEM_PATH expected); then rdi=&tfm_lit_system_mp, rsi=1, call mount_elev_require_system; `cmp rax,0; jne mount_test_tfm_case3_fail` (MOUNT_ELEV_DENY expected -> MR_RESULT_ELEVATION_STUB=4, return 3 on either mismatch). Case 4: rdi=&tfm_lit_good_cap, rsi=&tfm_narrowed, call volume_cap_resolve; `cmp rax,0; jne mount_test_tfm_case4_fail` (VC_OK expected); then rdi=[tfm_narrowed], rsi=&tfm_lit_user_mp, rdx=0 (flags, no --dry-run), rcx=&tfm_mount_id, r8=&tfm_raw_errno, call mount_op_invoke; `cmp rax,1; jne mount_test_tfm_case4_fail` (MOUNT_OP_ERR_KERNEL expected); rdi=[tfm_raw_errno], call mount_record_classify_mount_errno; `cmp rax,14; jne mount_test_tfm_case4_fail` (MR_RESULT_ENOSYS expected, return 4 on any of the three mismatches). All four passing falls through to return 0. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mount_test_tfm_.",
+      block: {
+        // ---- Case 1: malformed volume-cap hex tail. ------------------------
+        lea rdi, [rip + tfm_lit_bad_cap];
+        lea rsi, [rip + tfm_narrowed];
+        call volume_cap_resolve;
+        cmp rax, 1;                          // VC_ERR_BAD_URI
+        jne mount_test_tfm_case1_fail;
+
+        // ---- Case 2: mount point matching no known prefix. -----------------
+        lea rdi, [rip + tfm_lit_invalid_mp];
+        call mount_point_class;
+        cmp rax, 3;                          // MPC_INVALID
+        jne mount_test_tfm_case2_fail;
+
+        // ---- Case 3: system-path elevate stub. ------------------------------
+        lea rdi, [rip + tfm_lit_system_mp];
+        call mount_point_class;
+        cmp rax, 1;                          // MPC_SYSTEM_PATH
+        jne mount_test_tfm_case3_fail;
+
+        lea rdi, [rip + tfm_lit_system_mp];
+        mov rsi, 1;                          // MPC_SYSTEM_PATH
+        call mount_elev_require_system;
+        cmp rax, 0;                          // MOUNT_ELEV_DENY
+        jne mount_test_tfm_case3_fail;
+
+        // ---- Case 4: real mount attempt against the unwired kernel. --------
+        lea rdi, [rip + tfm_lit_good_cap];
+        lea rsi, [rip + tfm_narrowed];
+        call volume_cap_resolve;
+        cmp rax, 0;                          // VC_OK
+        jne mount_test_tfm_case4_fail;
+
+        mov rdi, [rip + tfm_narrowed];
+        lea rsi, [rip + tfm_lit_user_mp];
+        xor rdx, rdx;                        // flags = 0
+        lea rcx, [rip + tfm_mount_id];
+        lea r8, [rip + tfm_raw_errno];
+        call mount_op_invoke;
+        cmp rax, 1;                          // MOUNT_OP_ERR_KERNEL
+        jne mount_test_tfm_case4_fail;
+
+        mov rdi, [rip + tfm_raw_errno];
+        call mount_record_classify_mount_errno;
+        cmp rax, 14;                         // MR_RESULT_ENOSYS
+        jne mount_test_tfm_case4_fail;
+
+        xor rax, rax;                        // all four cases passed
+        ret;
+
+      mount_test_tfm_case1_fail:
+        mov rax, 1;
+        ret;
+
+      mount_test_tfm_case2_fail:
+        mov rax, 2;
+        ret;
+
+      mount_test_tfm_case3_fail:
+        mov rax, 3;
+        ret;
+
+      mount_test_tfm_case4_fail:
+        mov rax, 4;
+        ret;
+      }
+    }
+}
