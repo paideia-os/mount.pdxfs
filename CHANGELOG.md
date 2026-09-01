@@ -1,5 +1,20 @@
 # mount.pdxfs — CHANGELOG
 
+## 1.0.1 — 2026-09-01 (paideia-os#1976/#1977 satellite-embedding wiring)
+
+**Build tooling only, no source/wire-format change.** `tools/build.sh`
+now links `build-out/*.o` into `build-out/mount.pdxfs.elf` (+ `.bin` via
+`objcopy` where available) using a new root-level `link.ld`, matching
+paideia-os's own `src/user/true.ld` layout (`.bss` kept contiguous with
+`.data` per paideia-os#1595) and its `tools/build-user.sh` `ld`
+invocation convention (`--warn-common --fatal-warnings`). Adds a
+repeatable `--extra-obj-dir DIR` flag so a caller (e.g. paideia-os's own
+`/bin`-seeding build) can fold in out-of-tree `.o` dependencies; a
+missing or empty `DIR` contributes nothing and is not an error.
+Compile-time test scaffolding (`build-out/tests-*.o`) is excluded from
+the link. This is the linking half of wiring mount.pdxfs into
+paideia-os's boot-time `/bin` seeding pipeline (paideia-os#1976/#1977).
+
 ## 1.0.0 — 2026-08-31 (R53 wave close, M5-001)
 
 **First release.** Manifest scaffolded for a future dual-signed
