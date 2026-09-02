@@ -1,8 +1,8 @@
 # mount.pdxfs — status
 
-**Wave:** R53 (volume tooling — mkfs / mount / umount + shared library)
-**Current milestone:** M5 (signed release) — **landed** (source-form scaffold)
-**Version:** 1.0.0
+**Wave:** R90-XREPO (post-R53 satellite-cascade + libpdx-volume v1.1)
+**Current milestone:** M6 (libpdx-volume v1.1 API adoption) — **landed**
+**Version:** 1.1.1
 
 See `design/tooling/volume-tooling-ux.md` §9.2 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
@@ -258,15 +258,127 @@ small, distinct emit-commit-exit block per failure cause.
       landing, same status every other satellite repo's own release
       note carries) — no real mirror push happens in this repo.
 
+### M6 — libpdx-volume v1.1 API adoption — **landed**
+
+- [x] **M6-001 (#21)** — v1.1 cleanup adoption (`lpv_strerror` +
+      `pdxb_sb_get_*` accessors + banded `LPV_E_*` public consts):
+      landed. `src/lpv_errors_wire.pdx` (new) wraps `lpv_strerror` in
+      a bounded 48-byte scratch + fd-2 diagnostic write; the six
+      superblock accessors are consumed directly by the M6 wire
+      modules (no per-consumer shim). The library's own v1.1.0
+      `lpv_strerror` body is a scaffold returning 0 for every input
+      today — this wrapper skips the diagnostic write in that case
+      (no wasted syscall), matching the "unavailable" contract; once
+      the upstream dispatch chain is populated, this wrapper's
+      behaviour changes automatically. Parents: `libpdx-volume`
+      #18/#19/#20.
+- [x] **M6-002 (#22)** — LV.M2-003 elevate-cap wire-through:
+      landed at 1.1.0 (module `src/mint_wire.pdx`) but ORPHANED at
+      that landing — `mint_wire_invoke` had zero call sites in
+      `src/main.pdx`, and the system-tier path still called the
+      M3-era `mount_elev_require_system` stub (fixed exit 4,
+      `MR_RESULT_ELEVATION_STUB`) instead. **v1.1.1 (2026-09-02)**
+      completes the wiring: `src/main.pdx`'s Phase 3 SYSTEM_PATH /
+      CROSS_USER branch now calls `mint_wire_invoke(dev_cap=0,
+      mpc_class, &mount_narrowed_slot)`, dispatching MW_OK → jump
+      to `mount_main_mount_op` with the minted narrowed slot in
+      place (bypassing `volume_cap_resolve`), MW_ERR_NO_ELEVATE →
+      `mount_main_m22_no_elevate` (`MR_RESULT_NO_ELEVATE = 16`,
+      exit 3), MW_ERR_LIBPDX_VK → `mount_main_m22_mint_failed`
+      (NEW `MR_RESULT_MINT_FAILED = 22`, exit 3). Today's landing:
+      the refuse-gate inside `mint_wire_invoke` fires on every
+      system-tier call (no `KIND_ELEVATE_CHANNEL` cap provisioned),
+      so `NO_ELEVATE` is the only value the pipeline actually
+      reaches; `MR_RESULT_ELEVATION_STUB` (4) is no longer emitted
+      but the taxonomy code + label are retained for wire-format
+      compatibility. `dev_cap = 0` is a documented GAP: no
+      `KIND_BLOCK_DEVICE` resolver exists in this repo (or
+      upstream) that maps a `<volume-cap>` URI to the backing
+      dev_cap; safe today because the refuse-gate fires BEFORE
+      `vol_kind_mint_elevate` dereferences dev_cap. The M3-era
+      `mount_elev_require_system` remains defined in
+      `src/elevate.pdx` for its `M4-002` test driver's sake
+      (production call site REMOVED). Parent: `libpdx-volume` #23.
+- [x] **M6-003 (#23)** — LV.M3 snapshots (`--snapshot=<slot>` RO
+      mount + `--snapshot-list` enumeration): landed. New
+      `src/snapshot_wire.pdx` + argv extensions
+      (`PA_FLAG_SNAPSHOT_SET/LIST`, `PA_OFF_SNAPSHOT_SLOT` at
+      offset +24) + `main.pdx` M6 dispatch (`mount_main_m6_snap_
+      list`/`_snap_mount` labels).
+      `--snapshot=` narrows to `R_VSNAP_READ` via `vol_snapshot_
+      narrow` then would issue a snap-mount kernel op — KERNEL
+      GAP #A (no such syscall exists), so every legal call refuses
+      `MR_RESULT_SNAPSHOT_NOT_IMPL = 17` after passing narrow.
+      `--snapshot-list` is a pure passthrough to `snap_chain_walk`
+      (itself a documented stub upstream — GAP #B in `libpdx-
+      volume`), likewise refusing `SNAPSHOT_NOT_IMPL`. FROZEN gate
+      (`snapshot_wire_check_frozen`) wired but unreachable until
+      GAP #B closes upstream. Parents: `libpdx-volume` #25/#26.
+- [x] **M6-004 (#24 A)** — LV.M5 `--passphrase-fd=<n>` argv +
+      KEK-derive + DEK-unwrap composition: landed as a wire module
+      + argv-parser plumbing; call site deferred. New
+      `src/passphrase_wire.pdx` (real bodies over `pdxb_kek_derive`
+      + `pdxb_dek_unwrap`, with a defensive byte-zero wipe helper
+      for the KEK/DEK/passphrase scratch). Argv parses
+      `--passphrase-fd=<n>` into `ParsedArgv.passphrase_fd` (offset
+      +32, i64, -1 sentinel unset). Mount-time hook that calls the
+      wire is a Phase-5 addition deferred behind GAP #P2 (no
+      `KIND_DEK` cap kernel-side) and the pre-existing M2 gap
+      (`dispatch_mount` unwired). The dispatched path today
+      silently ignores `--passphrase-fd` at the mount hop; a
+      follow-up landing wires it once both gaps close. Parents:
+      `libpdx-volume` #29/#30.
+- [x] **M6-005 (#24 B)** — LV.M4 quota enforcement wrapper:
+      landed. New `src/quota_wire.pdx`. `quota_wire_sb_has_quota`
+      + `quota_wire_install` (documented no-op stub per GAP #Q1:
+      no `KIND_PDXFS_QUOTA` cap kernel-side) + `quota_wire_check_
+      or_refuse` (REAL body over `pdxb_quota_check` with the
+      tool's `EDQUOT`-style refusal contract; call sites appear
+      once mount.pdxfs — or a companion FS-write daemon — grows a
+      real write path, per GAP #Q2). Parent: `libpdx-volume` #28.
+- [x] **M6-006 (#24 C)** — LV.M6 dep-graph refusal (`--all`
+      surface): landed. New `src/dep_graph_wire.pdx` +
+      `main.pdx::mount_main_m6_all` handler. `dep_graph_wire_sort`
+      is a thin adapter over `mount_table_sort_by_deps` (stub
+      today, returns `LPV_ORDER_ERR_NOT_IMPL = 0x0A04` for every
+      non-empty input). `--all` invocation emits
+      `MR_RESULT_DEP_ORDER_NOT_IMPL = 21` + exit 3, refusing
+      cleanly BEFORE any real mount happens. Parent:
+      `libpdx-volume` #31.
+
+`src/main.pdx`'s `_start` grew an M6 mode-dispatch block right after
+argv parse, checking `PA_FLAG_ALL` → `PA_FLAG_SNAPSHOT_LIST` →
+`PA_FLAG_SNAPSHOT_SET` in fixed precedence order and jumping to the
+matching M6 handler. `--passphrase-fd` deliberately has no M6 branch;
+it falls through to the legacy pipeline (its mount-time consumption
+is a future Phase-5 wiring, gated on GAPs #P2 and the M2
+`dispatch_mount` unwired-stub).
+
+`src/mount_record.pdx` grew six new `MR_RESULT_*` codes (16..21) at
+v1.1.0 and their matching label literals, wired into `mount_record_
+emit_result`'s cmp/je dispatch chain. **v1.1.1** adds a seventh:
+`MR_RESULT_MINT_FAILED = 22` (`MINT_FAILED` literal), reachable only
+via `mint_wire_invoke`'s MW_ERR_LIBPDX_VK arm (unreachable at this
+landing since the refuse-gate consumes every system-tier call).
+
+`src/argv.pdx`'s `ParsedArgv` widened from 24 bytes to 48 bytes: the
+M1 offsets are byte-for-byte unchanged; every M6 addition is APPENDED
+at offset +24/+32/+40. Positional-requirement gates relax per the
+M6 surface (`--all` requires neither positional; `--snapshot-list`
+requires only `<volume-cap>`; `--snapshot=` requires only
+`<mount-point>`).
+
 ## Next milestone
 
-None currently scoped past M5. `mount.pdxfs` v1.0.0's real, end-to-end
+None currently scoped past M6. `mount.pdxfs` v1.1.0's real, end-to-end
 mount path remains blocked on the three kernel-side gaps `src/mount_op.
 pdx` and `src/elevate.pdx` each document in full (`dispatch_mount`'s
 unwired stub, the two-incompatible-ABI question, `KIND_PDXFS_MOUNT_
 TABLE`'s unwired `APPEND_ROW`, and `libpdx-elevate`'s unprovisioned
-broker-endpoint cap) — none of which is this repo's own milestone to
-close. Three concrete asks carried forward from M2, unchanged:
+broker-endpoint cap) plus the six NEW M6 gaps (KERNEL GAPs #A/#B, and
+GAPs #P1/#P2/#Q1/#Q2 documented above and in each new wire module's
+own header) — none of which is this repo's own milestone to close.
+Three concrete asks carried forward from M2, unchanged:
 
 1. Which ABI sysno 75 (`sys_mount`) should grow into: the cap-slot
    contract `dispatch.pdx`'s own forward-declaration comment documents,

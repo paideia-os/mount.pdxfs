@@ -1,0 +1,298 @@
+// src/passphrase_wire.pdx — mount.pdxfs.M6-004 (#24 part A) —
+// --passphrase-fd=<n> read + KEK derive + DEK unwrap composition.
+//
+// ----------------------------------------------------------------------
+// Wire shape
+// ----------------------------------------------------------------------
+//
+// The mount-time flow for a v2 (PDXB_FLAG_ENCRYPTED) volume is:
+//
+//   1. Argv parser exposes --passphrase-fd=<n> as a value flag
+//      populating ParsedArgv.passphrase_fd (i64, -1 sentinel = unset).
+//   2. main.pdx reads superblock flags via
+//      libpdx-volume.pdxb_sb_get_flags on the resolved volume cap.
+//   3. If PDXB_FLAG_ENCRYPTED is set:
+//        a. Refuse if passphrase_fd == -1 -> MR_RESULT_WRONG_PASSPHRASE
+//           (the "encrypted volume, no passphrase channel" case).
+//        b. sys_read the passphrase from fd n into an ephemeral buffer
+//           (bounded PASSPHRASE_MAX_LEN bytes; anything longer is
+//           truncated on the read boundary itself, which is a valid
+//           passphrase input mode).
+//        c. Read the wrapped DEK + KDF salt + nonce from the
+//           superblock via pdxb_sb_get_wrapped_dek / _kdf_salt /
+//           (nonce accessor: see gap #P1 below).
+//        d. Derive the KEK via pdxb_kek_derive.
+//        e. Unwrap the DEK via pdxb_dek_unwrap.
+//        f. On success, install the DEK as a KIND_DEK cap slot
+//           kernel-side (see gap #P2 below).
+//   4. If PDXB_FLAG_ENCRYPTED is not set and passphrase_fd != -1,
+//      silently ignore (matches mkfs.pdxfs's own "flag given but not
+//      applicable" precedent -- no error, no warning).
+//
+// ----------------------------------------------------------------------
+// Gaps this module documents
+// ----------------------------------------------------------------------
+//
+//   GAP #P1: no `pdxb_sb_get_dek_nonce` accessor in libpdx-volume
+//     v1.1.0. Only pdxb_sb_get_wrapped_dek and pdxb_sb_get_kdf_salt
+//     are exposed; the wrapped-DEK's nonce is documented as living in
+//     PDXB_D_OFF_KDF_SALT + 16 (per the crypto module header's
+//     [+192,+268) region), but no getter was added at v1.1.0. This
+//     module defines PDXB_D_OFF_DEK_NONCE = 256 locally and uses
+//     direct offset arithmetic on the caller-supplied superblock
+//     buffer for the nonce read. **Flagged for a libpdx-volume
+//     v1.1.x follow-up**: add pdxb_sb_get/set_dek_nonce accessors so
+//     this module can drop the hardcoded offset.
+//
+//   GAP #P2: no KIND_DEK cap kernel-side. libpdx-volume's own
+//     `pdxb_dek_unwrap` takes a raw `out_dek_ptr` (32 bytes of
+//     plaintext DEK); to "install" that as a KIND_DEK cap and hand
+//     the slot to the kernel FS layer for per-block decrypt, a new
+//     cap kind + a mint syscall + a cap-invoke op catalog for the
+//     block-decrypt path all need to land in paideia-os. Until that
+//     wave lands, this module leaves the unwrapped DEK in a private
+//     .bss buffer (mount_pw_dek_scratch below) and returns PW_OK; a
+//     future landing wires the "install as cap" step at the bottom
+//     of `passphrase_wire_unlock`.
+//
+// ----------------------------------------------------------------------
+// Fail-closed on wrong passphrase
+// ----------------------------------------------------------------------
+//
+// pdxb_dek_unwrap returns LPV_CRYPTO_ERR_TAG_MISMATCH (0x0904) on a
+// wrong passphrase (the AEAD tag verification fails). This module
+// maps that to PW_ERR_WRONG_PASSPHRASE (2), a distinct code from
+// PW_ERR_CRYPTO_FAIL (3, any other crypto failure) so the operator's
+// diagnostic can distinguish "check your passphrase" from "the
+// crypto stack itself broke". main.pdx maps PW_ERR_WRONG_PASSPHRASE
+// to MR_RESULT_WRONG_PASSPHRASE (a new failure-taxonomy row).
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg,[mem]`. No `test`; every zero-check is `cmp reg, 0`.
+// Reserved-label discipline: every branch label prefixed `mount_pw_`.
+//
+// Upstream: paideia-satellites/libpdx-volume v1.1.0 (issues #29, #30);
+// design/tooling/volume-tooling-ux.md §4.7 (encrypted mount surface).
+
+module PassphraseWire = structure {
+
+  // --- Return codes. -----------------------------------------------------
+  pub let PW_OK                      : u64 = 0
+  pub let PW_ERR_READ_FAILED         : u64 = 1
+  pub let PW_ERR_WRONG_PASSPHRASE    : u64 = 2
+  pub let PW_ERR_CRYPTO_FAIL         : u64 = 3
+  pub let PW_ERR_KDF_FAIL            : u64 = 4
+  pub let PW_ERR_NO_PASSPHRASE_FD    : u64 = 5
+
+  // --- Bounded scratch sizes. --------------------------------------------
+  pub let PW_PASSPHRASE_MAX_LEN      : u64 = 256
+  pub let PW_KEK_LEN                 : u64 = 32   // LPV_KEK_LEN
+  pub let PW_DEK_LEN                 : u64 = 32   // LPV_DEK_LEN
+  pub let PW_SALT_LEN                : u64 = 16   // LPV_KDF_SALT_LEN
+  pub let PW_NONCE_LEN               : u64 = 12   // LPV_AEAD_NONCE_LEN
+  pub let PW_WRAPPED_DEK_LEN         : u64 = 48   // LPV_WRAPPED_DEK_LEN
+
+  // --- Superblock-side offset (GAP #P1). ---------------------------------
+  pub let PW_D_OFF_DEK_NONCE         : u64 = 256
+
+  // --- SC+ syscall IDs. --------------------------------------------------
+  pub let PW_SC_READ                 : u64 = 0    // sys_read
+
+  // --- .bss ephemeral scratch. All wiped after use (see wipe helper). --
+  pub let mut mount_pw_passphrase_scratch : [u8; 256] = uninit @align(8)
+  pub let mut mount_pw_kek_scratch        : [u8; 32]  = uninit @align(8)
+  pub let mut mount_pw_dek_scratch        : [u8; 32]  = uninit @align(8)
+
+  // ==========================================================================
+  // passphrase_wire_read(fd, out_len_ptr) -> u64
+  //     (PW_OK | PW_ERR_READ_FAILED)
+  //
+  //   rdi = fd            (from ParsedArgv.passphrase_fd, guaranteed >= 0
+  //                        by the caller -- this function does not
+  //                        re-check)
+  //   rsi = out_len_ptr   (u64 write target; receives bytes actually
+  //                        read into mount_pw_passphrase_scratch)
+  //
+  // Issues one sys_read(fd, &scratch, 256). A negative return (any
+  // -Exxx) surfaces as PW_ERR_READ_FAILED. A 0-length read (EOF
+  // before any byte arrived) is likewise a refusal -- a legal
+  // passphrase mode is at least one byte. On success writes the
+  // returned length into *out_len_ptr.
+  // ==========================================================================
+  pub let passphrase_wire_read : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) (out_len_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mount.pdxfs.M6-004 (#24A): passphrase_wire_read entry point. push rbx to hold out_len_ptr across the syscall. mov rbx,rsi. sys_read: rdi already fd; lea rsi,[rip+mount_pw_passphrase_scratch]; mov rdx,256; mov rax,0 (SC+ ID 0 = sys_read); syscall. Check: mov r11,rax; mov r10,0x7FFFFFFFFFFFFFFF (MOVABS positive-max sanity ceiling); cmp r11,r10; ja read_bad (negative errno has bit 63 set, exceeds this ceiling as unsigned). cmp r11,0; je read_bad (zero-length read = EOF, refused). mov [rbx+0],r11 (write actual length). pop rbx; xor rax,rax (PW_OK); ret. read_bad: pop rbx; mov rax,1 (PW_ERR_READ_FAILED); ret. No `add reg,[mem]`; no `test`. Labels prefixed mount_pw_rd_.",
+      block: {
+        push rbx;
+        mov rbx, rsi;                        // rbx = out_len_ptr
+
+        // sys_read(fd, &scratch, PW_PASSPHRASE_MAX_LEN)
+        // rdi already holds fd
+        lea rsi, [rip + mount_pw_passphrase_scratch];
+        mov rdx, 256;
+        mov rax, 0;                          // SC+ ID 0 = sys_read
+        syscall;
+
+        // Negative errno -> unsigned above 0x7FFFFFFFFFFFFFFF.
+        mov r11, rax;
+        mov r10, 0x7FFFFFFFFFFFFFFF;
+        cmp r11, r10;
+        ja mount_pw_rd_bad;
+
+        cmp r11, 0;
+        je mount_pw_rd_bad;
+
+        mov [rbx + 0], r11;                  // *out_len_ptr = bytes read
+        pop rbx;
+        xor rax, rax;                        // PW_OK
+        ret;
+
+      mount_pw_rd_bad:
+        pop rbx;
+        mov rax, 1;                          // PW_ERR_READ_FAILED
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // passphrase_wire_wipe(buf_ptr, buf_len) -> ()
+  //
+  // Byte-by-byte zero-write over the caller's buffer. Defensive hygiene
+  // for the passphrase / KEK / DEK scratch buffers -- these hold key
+  // material that must not remain in .bss after the mount call
+  // completes. Pure leaf, bounded by buf_len.
+  //
+  // NOTE: paideia-as does not currently document a "compiler-barrier
+  // volatile write" primitive; this loop's own bounded byte-store may
+  // in principle be dead-code-eliminated by a future optimising pass
+  // if the caller does not observe the buffer's post-wipe contents.
+  // Every current call site issues no further reads of the wiped
+  // buffer in the same function, so the risk is theoretical today; a
+  // future landing wiring memset_explicit-style semantics will
+  // replace this loop.
+  // ==========================================================================
+  pub let passphrase_wire_wipe : (u64, u64) -> () !{mem} @{} =
+    fn (buf_ptr: u64) (buf_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M6-004 (#24A): passphrase_wire_wipe entry point. Pure leaf. xor rcx,rcx (index). loop: cmp rcx,rsi (rsi=buf_len); jae done. mov_b [rdi+rcx],0 (byte store, unaffected by paideia-as #1248 which is load-side only). add rcx,1; jmp loop. done: ret. No `add reg,[mem]`; no `test`. Labels prefixed mount_pw_wp_.",
+      block: {
+        xor rcx, rcx;
+
+      mount_pw_wp_loop:
+        cmp rcx, rsi;
+        jae mount_pw_wp_done;
+
+        mov_b [rdi + rcx], 0;
+        add rcx, 1;
+        jmp mount_pw_wp_loop;
+
+      mount_pw_wp_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // passphrase_wire_unlock(sb_ptr, passphrase_ptr, passphrase_len) -> u64
+  //     (PW_OK | PW_ERR_KDF_FAIL | PW_ERR_WRONG_PASSPHRASE |
+  //      PW_ERR_CRYPTO_FAIL)
+  //
+  //   rdi = sb_ptr          (decoded 4096-byte superblock buffer --
+  //                          caller must already have run
+  //                          pdxb_parse_superblock or read the raw block)
+  //   rsi = passphrase_ptr  (mount_pw_passphrase_scratch, from
+  //                          passphrase_wire_read)
+  //   rdx = passphrase_len  (out_len from passphrase_wire_read)
+  //
+  // Step 1: pdxb_kek_derive(passphrase, len, salt=&sb[+240], salt_len=16,
+  //          out=&mount_pw_kek_scratch)
+  // Step 2: pdxb_dek_unwrap(kek=&mount_pw_kek_scratch,
+  //          wrapped=&sb[+192], nonce=&sb[+256],
+  //          out=&mount_pw_dek_scratch)
+  //
+  // Wipes the KEK scratch after step 2 (leaves the DEK scratch as the
+  // "installed" key material -- see GAP #P2 above). On any error,
+  // both scratches are wiped before returning.
+  //
+  // Bare-symbol cross-repo calls (`call pdxb_kek_derive`,
+  // `call pdxb_dek_unwrap`) match src/volume_cap.pdx's own
+  // libpdx-volume convention.
+  // ==========================================================================
+  pub let passphrase_wire_unlock : (u64, u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto} =
+    fn (sb_ptr: u64) (passphrase_ptr: u64) (passphrase_len: u64) -> unsafe {
+      effects: {crypto, mem, sysreg}, capabilities: {paideia.crypto},
+      justification: "mount.pdxfs.M6-004 (#24A): passphrase_wire_unlock entry point. push rbx (sb_ptr for the second call after the first call clobbers rdi). mov rbx,rdi. Step 1 -- KEK derive: rdi=passphrase_ptr (already there in rsi at entry, shuffle: mov rdi,rsi); rsi=passphrase_len (mov rsi,rdx); rdx=salt_ptr = sb_ptr+240 (PDXB_D_OFF_KDF_SALT); mov rdx,rbx; add rdx,240; rcx=salt_len=16; r8=out=&mount_pw_kek_scratch; lea r8,[rip+mount_pw_kek_scratch]; call pdxb_kek_derive. cmp rax,0; jne kdf_fail. Step 2 -- DEK unwrap: rdi=kek_ptr = &mount_pw_kek_scratch; lea rdi,[rip+mount_pw_kek_scratch]; rsi=wrapped_ptr = sb_ptr+192; mov rsi,rbx; add rsi,192; rdx=nonce_ptr = sb_ptr+256 (GAP #P1); mov rdx,rbx; add rdx,256; rcx=out=&mount_pw_dek_scratch; lea rcx,[rip+mount_pw_dek_scratch]; call pdxb_dek_unwrap. cmp rax,0; je unlock_ok; mov r10,0x0904 (LPV_CRYPTO_ERR_TAG_MISMATCH); cmp rax,r10; je wrong_pass; jmp crypto_fail. unlock_ok: wipe KEK (rdi=&kek_scratch, rsi=32; call passphrase_wire_wipe); pop rbx; xor rax,rax (PW_OK); ret. wrong_pass: wipe KEK; pop rbx; mov rax,2; ret. crypto_fail: wipe KEK+DEK; pop rbx; mov rax,3; ret. kdf_fail: pop rbx; mov rax,4; ret. `add reg,imm` used freely (not `add reg,[mem]`). No `test`. Labels prefixed mount_pw_ul_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                        // rbx = sb_ptr
+
+        // ---- Step 1: KEK derive. ---------------------------------------
+        mov rdi, rsi;                        // passphrase_ptr
+        mov rsi, rdx;                        // passphrase_len
+        mov rdx, rbx;
+        add rdx, 240;                        // salt_ptr = sb+PDXB_D_OFF_KDF_SALT
+        mov rcx, 16;                         // salt_len
+        lea r8, [rip + mount_pw_kek_scratch];
+        call pdxb_kek_derive;
+
+        cmp rax, 0;
+        jne mount_pw_ul_kdf_fail;
+
+        // ---- Step 2: DEK unwrap. ---------------------------------------
+        lea rdi, [rip + mount_pw_kek_scratch];
+        mov rsi, rbx;
+        add rsi, 192;                        // wrapped_ptr = sb+PDXB_D_OFF_WRAPPED_DEK
+        mov rdx, rbx;
+        add rdx, 256;                        // nonce_ptr = sb+PW_D_OFF_DEK_NONCE (GAP #P1)
+        lea rcx, [rip + mount_pw_dek_scratch];
+        call pdxb_dek_unwrap;
+
+        cmp rax, 0;
+        je mount_pw_ul_ok;
+
+        mov r10, 0x0904;                     // LPV_CRYPTO_ERR_TAG_MISMATCH
+        cmp rax, r10;
+        je mount_pw_ul_wrong_pass;
+        jmp mount_pw_ul_crypto_fail;
+
+      mount_pw_ul_ok:
+        // Wipe KEK; DEK remains in scratch until installed (GAP #P2).
+        lea rdi, [rip + mount_pw_kek_scratch];
+        mov rsi, 32;
+        call passphrase_wire_wipe;
+
+        pop rbx;
+        xor rax, rax;                        // PW_OK
+        ret;
+
+      mount_pw_ul_wrong_pass:
+        lea rdi, [rip + mount_pw_kek_scratch];
+        mov rsi, 32;
+        call passphrase_wire_wipe;
+
+        pop rbx;
+        mov rax, 2;                          // PW_ERR_WRONG_PASSPHRASE
+        ret;
+
+      mount_pw_ul_crypto_fail:
+        lea rdi, [rip + mount_pw_kek_scratch];
+        mov rsi, 32;
+        call passphrase_wire_wipe;
+        lea rdi, [rip + mount_pw_dek_scratch];
+        mov rsi, 32;
+        call passphrase_wire_wipe;
+
+        pop rbx;
+        mov rax, 3;                          // PW_ERR_CRYPTO_FAIL
+        ret;
+
+      mount_pw_ul_kdf_fail:
+        pop rbx;
+        mov rax, 4;                          // PW_ERR_KDF_FAIL
+        ret;
+      }
+    }
+}

@@ -32,17 +32,27 @@
 //      (this call) and the RESULT event (every terminal `call
 //      mount_audit_commit` below) -- see audit_wire.pdx's own module
 //      header for why no separate parent_audit_id exists or is needed.
-//   3. NEW at M3 (#7): classify <mount-point> via Elevate::mount_point_
-//      class (src/elevate.pdx) -> MPC_USER_SUBTREE (0) falls straight
-//      through to step 4 (no elevate). MPC_INVALID (3) emits result_code
-//      INVALID_MOUNT_POINT and exits 3 -- a DISTINCT code from M2's own
-//      folded-into-KERNEL_ERROR treatment. MPC_SYSTEM_PATH (1) or MPC_
-//      CROSS_USER (2, unreachable at this landing -- see elevate.pdx's
-//      own header) call Elevate::mount_elev_require_system, which
-//      ALWAYS returns MOUNT_ELEV_DENY at this landing (no libpdx-elevate
-//      broker cap provisioned -- see that file's own header for the
-//      full write-up): result_code ELEVATION_STUB, exit 4. The GRANT arm
-//      is real, wired code, kept for the day a broker cap exists.
+//   3. NEW at M3 (#7), rewired at M6-002 v1.1.1 (#22): classify
+//      <mount-point> via Elevate::mount_point_class (src/elevate.pdx)
+//      -> MPC_USER_SUBTREE (0) falls straight through to step 4 (no
+//      elevate). MPC_INVALID (3) emits result_code INVALID_MOUNT_POINT
+//      and exits 3 -- a DISTINCT code from M2's own folded-into-KERNEL_
+//      ERROR treatment. MPC_SYSTEM_PATH (1) or MPC_CROSS_USER (2,
+//      unreachable at this landing) now call MintWire::mint_wire_invoke
+//      (src/mint_wire.pdx) instead of the M3-era mount_elev_require_
+//      system stub. mint_wire_invoke composes the tier-driven elevate
+//      selection with libpdx-volume's new 3-arg vol_kind_mint_elevate
+//      form: without a KIND_ELEVATE_CHANNEL cap (today's landing) it
+//      refuses BEFORE the library call, returning MW_ERR_NO_ELEVATE (1)
+//      -> result_code NO_ELEVATE (16), exit 3. MW_ERR_LIBPDX_VK (2) ->
+//      result_code MINT_FAILED (22), exit 3. MW_OK (0) writes a fresh
+//      KIND_VOLUME slot into mount_narrowed_slot and jumps DIRECTLY to
+//      mount_main_mount_op, bypassing volume_cap_resolve (the raw
+//      <volume-cap> URI is unused on the elevated path -- the minted
+//      slot IS the cap sys_mount consumes). The MR_RESULT_ELEVATION_
+//      STUB (4) exit no longer reachable from this pipeline -- code
+//      constant kept for wire-format compatibility, taxonomy label
+//      retained in mount_record_emit_result.
 //   4. Resolve + narrow <volume-cap> via VolumeCap::volume_cap_resolve
 //      (src/volume_cap.pdx, #4, UNCHANGED): VC_ERR_BAD_URI now emits its
 //      OWN result_code (BAD_VOLUME_CAP) rather than folding into
@@ -117,12 +127,16 @@
 
 module Main = structure {
 
-  // --- ParsedArgv scratch struct (Argv::PA_STRUCT_BYTES = 24 bytes). ------
-  // .bss, zero-initialised by the loader before _start runs; argv_parse
-  // additionally writes every field explicitly so this function never
-  // reads stale/uninit bytes even on a build where .bss zero-init were
-  // somehow skipped.
-  pub let mut mount_argv_out : [u8; 24] = uninit @align(8)
+  // --- ParsedArgv scratch struct (Argv::PA_STRUCT_BYTES = 48 bytes
+  //     as of M6 -- was 24 at M1-M3; every M6 addition is APPENDED
+  //     past offset +24 so the M1/M2/M3 loads below at +0/+8/+16 are
+  //     byte-for-byte unchanged). .bss, zero-initialised by the
+  //     loader before _start runs; argv_parse additionally writes
+  //     every field explicitly (including the -1 sentinel for the
+  //     new i64 passphrase_fd slot at +32) so this function never
+  //     reads stale/uninit bytes even on a build where .bss zero-init
+  //     were somehow skipped. -----------------------------------------
+  pub let mut mount_argv_out : [u8; 48] = uninit @align(8)
 
   // --- M2 scratch: the narrowed KIND_VOLUME cap slot (VolumeCap::
   //     volume_cap_resolve's out-param) and the mount_id MountOp::
@@ -142,6 +156,16 @@ module Main = structure {
   pub let mount_msg_missing_mount_point     : [u8; 34] = "mount.pdxfs: missing mount-point\n\0"
   pub let mount_msg_missing_mount_point_len : u64 = 33
 
+  // --- M6 placeholder ("-") for the emitter's volume_cap / mount_point
+  //     slots when the M6 argv surface makes one of them optional --
+  //     e.g. `--all` takes neither positional, `--snapshot-list` takes
+  //     only <volume-cap>, `--snapshot=<slot>` takes only <mount-point>.
+  //     The argv parser's own relax-gates leave the omitted slot at 0;
+  //     the terminal emit substitutes this literal so mount_record_strlen
+  //     never dereferences a NULL. Not user-facing text; a `-` reads
+  //     cleanly in the emitted record. ----------------------------------
+  pub let mount_main_lit_none : [u8; 2] = "-\0"
+
   // ==========================================================================
   // _start -- user program entry point. Never returns (every terminal
   // path ends in sys_exit).
@@ -150,7 +174,7 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched, cap},
-      justification: "mount.pdxfs.M1-001/M1-003 (#3) + M2-001/M2-002/M2-003 (#4/#5/#6) + M3 (#7/#8/#9/#10): mount.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below -- r12/r13 are then REPURPOSED once argv_parse returns (argc/argv are dead past that point; r12 becomes mount_point_ptr, r13 becomes audit_id, matching the module header's register plan). Phase 1 (unchanged from M1/M2): rdi=r12(argc), rsi=r13(argv), rdx=&mount_argv_out, call argv_parse. On ARGV_ERR_MISSING_VOLUME_CAP (rax==1) or ARGV_ERR_MISSING_MOUNT_POINT (rax==2), print the matching fd-2 diagnostic and sys_exit(2) -- identical to M1/M2, no audit record opened. Phase 2 (on ARGV_OK): r14=&ParsedArgv; rbx=[r14+0] (flags); r15=[r14+8] (volume_cap_ptr); r12=[r14+16] (mount_point_ptr) -- r14 is dead after these three loads. NEW at M3 (#8): rdi=r12 (mount_point_ptr), rax=rbx&0x8 (Argv::PA_FLAG_DRY_RUN, 0 or 8) moved into rsi (dry_run_flag), `call mount_audit_begin` (src/audit_wire.pdx) -> rax=audit_id; `mov r13, rax` (argv is dead; see module header). Phase 3 (elevate classification, #7): rdi=r12; call mount_point_class (src/elevate.pdx) -> rax in {0,1,2,3}. rax==3 (MPC_INVALID) -> mount_main_invalid_mount_point (result_code INVALID_MOUNT_POINT=5, exit 3). rax==0 (MPC_USER_SUBTREE) -> falls through to mount_main_volume_resolve, no elevate. rax==1 or 2 (MPC_SYSTEM_PATH / MPC_CROSS_USER, the latter unreachable at this landing -- see elevate.pdx's own header): rdi=r12, rsi=rax (mpc_class), call mount_elev_require_system -> rax in {MOUNT_ELEV_DENY=0, MOUNT_ELEV_GRANT=1}; `cmp rax,1; je mount_main_volume_resolve` (GRANT, real/wired/unreachable at this landing) else falls into mount_main_elevation_stub (the only value reachable today: result_code ELEVATION_STUB=4, exit 4). Phase 4 (volume-cap resolve, #4, UNCHANGED body): rdi=r15 (volume_cap_ptr), rsi=&mount_narrowed_slot (rip-relative lea); call volume_cap_resolve -> rax in {0,1,2}; rax==0 (VC_OK) falls through to mount_main_mount_op; rax==1 (VC_ERR_BAD_URI) -> mount_main_bad_volume_cap (result_code BAD_VOLUME_CAP=6, exit 3); rax==2 (VC_ERR_NARROW_FAILED) or anything else -> mount_main_narrow_failed (result_code NARROW_FAILED=7, exit 3) -- a DISTINCT-code split from M2's own single KERNEL_ERROR fold. Phase 5 (mount op, #5, extended M3-004 #10): rdi=[rip+mount_narrowed_slot] (a plain memory-operand load, not `add reg,[mem]`), rsi=r12 (mount_point_ptr), rdx=rbx (full flags bitmask), rcx=&mount_id_out, r8=&mount_raw_errno_out (NEW); call mount_op_invoke -> rax in {0,1}; rax==0 (MOUNT_OP_OK) falls through to mount_main_success. rax==1 (MOUNT_OP_ERR_KERNEL) falls straight through (no label, no jmp) into the classify-and-emit block: rdi=[rip+mount_raw_errno_out]; call mount_record_classify_mount_errno (src/mount_record.pdx, #10) -> rax=result_code; `mov r9, rax` (scratch, not otherwise live past this point) then builds the emit call with rcx=r9. Phase 6 (success path, mount_main_success): re-test rbx & 0x8 (Argv::PA_FLAG_DRY_RUN) to choose DRY_RUN vs OK -- mount_op_invoke's own dry-run gate already skipped the syscall internally; this second test only selects which result_code label to print, since mount_op_invoke's return alone cannot distinguish 'dry-run success' from 'real success' (both are MOUNT_OP_OK). Every terminal branch (mount_main_invalid_mount_point, mount_main_elevation_stub, mount_main_bad_volume_cap, mount_main_narrow_failed, mount_main_emit_mount_op_error, and both success sub-branches) follows the SAME three-step shape: rdi=r15, rsi=r12, rdx=rbx, rcx=<result_code>, r8=<mount_id or 0>, `call mount_pipe_emit_result` (src/pipe_wire.pdx, #9 -- replaces every M2 direct call to MountRecord::mount_record_emit_result); rdi=r13 (audit_id), rsi=<this branch's real exit status>, `call mount_audit_commit` (src/audit_wire.pdx, #8 -- the RESULT record, sharing r13's audit_id with Phase 2's INTENT record); rdi=<same exit status>, jmp mount_main_exit. Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders for the impossible fallthrough, matching every other _start in the paideia-os monorepo's src/user/ tree. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mount_main_.",
+      justification: "mount.pdxfs.M1-001/M1-003 (#3) + M2-001/M2-002/M2-003 (#4/#5/#6) + M3 (#7/#8/#9/#10): mount.pdxfs _start. Stashes argc (rdi) into r12 and argv (rsi) into r13 immediately (both SysV callee-save) so they survive the `call argv_parse` below -- r12/r13 are then REPURPOSED once argv_parse returns (argc/argv are dead past that point; r12 becomes mount_point_ptr, r13 becomes audit_id, matching the module header's register plan). Phase 1 (unchanged from M1/M2): rdi=r12(argc), rsi=r13(argv), rdx=&mount_argv_out, call argv_parse. On ARGV_ERR_MISSING_VOLUME_CAP (rax==1) or ARGV_ERR_MISSING_MOUNT_POINT (rax==2), print the matching fd-2 diagnostic and sys_exit(2) -- identical to M1/M2, no audit record opened. Phase 2 (on ARGV_OK): r14=&ParsedArgv; rbx=[r14+0] (flags); r15=[r14+8] (volume_cap_ptr); r12=[r14+16] (mount_point_ptr) -- r14 is dead after these three loads. NEW at M3 (#8): rdi=r12 (mount_point_ptr), rax=rbx&0x8 (Argv::PA_FLAG_DRY_RUN, 0 or 8) moved into rsi (dry_run_flag), `call mount_audit_begin` (src/audit_wire.pdx) -> rax=audit_id; `mov r13, rax` (argv is dead; see module header). Phase 3 (elevate classification, #7): rdi=r12; call mount_point_class (src/elevate.pdx) -> rax in {0,1,2,3}. rax==3 (MPC_INVALID) -> mount_main_invalid_mount_point (result_code INVALID_MOUNT_POINT=5, exit 3). rax==0 (MPC_USER_SUBTREE) -> falls through to mount_main_volume_resolve, no elevate. rax==1 or 2 (MPC_SYSTEM_PATH / MPC_CROSS_USER, the latter unreachable at this landing): M6-002 v1.1.1 (#22 wire-through): xor rdi,rdi (dev_cap=0, documented GAP: no KIND_BLOCK_DEVICE resolver in this repo -- safe today because mint_wire_invoke's refuse-gate fires on every reachable input before dev_cap is dereferenced), mov rsi,rax (mpc_class), lea rdx,[rip+mount_narrowed_slot], call mint_wire_invoke -> rax in {MW_OK=0, MW_ERR_NO_ELEVATE=1, MW_ERR_LIBPDX_VK=2}. MW_OK jumps DIRECTLY to mount_main_mount_op (narrowed KIND_VOLUME slot already in mount_narrowed_slot; volume_cap_resolve entirely skipped on the elevated path). MW_ERR_NO_ELEVATE -> mount_main_m22_no_elevate: result_code NO_ELEVATE=16, exit 3. MW_ERR_LIBPDX_VK or unrecognised -> mount_main_m22_mint_failed: result_code MINT_FAILED=22, exit 3. The M3-era mount_elev_require_system call site and mount_main_elevation_stub label are REMOVED; the MR_RESULT_ELEVATION_STUB (4) taxonomy label is retained in mount_record_emit_result for wire-format compatibility with any 1.0.x/1.1.0 record consumer, but no code path in v1.1.1 emits it. Phase 4 (volume-cap resolve, #4, UNCHANGED body): rdi=r15 (volume_cap_ptr), rsi=&mount_narrowed_slot (rip-relative lea); call volume_cap_resolve -> rax in {0,1,2}; rax==0 (VC_OK) falls through to mount_main_mount_op; rax==1 (VC_ERR_BAD_URI) -> mount_main_bad_volume_cap (result_code BAD_VOLUME_CAP=6, exit 3); rax==2 (VC_ERR_NARROW_FAILED) or anything else -> mount_main_narrow_failed (result_code NARROW_FAILED=7, exit 3) -- a DISTINCT-code split from M2's own single KERNEL_ERROR fold. Phase 5 (mount op, #5, extended M3-004 #10): rdi=[rip+mount_narrowed_slot] (a plain memory-operand load, not `add reg,[mem]`), rsi=r12 (mount_point_ptr), rdx=rbx (full flags bitmask), rcx=&mount_id_out, r8=&mount_raw_errno_out (NEW); call mount_op_invoke -> rax in {0,1}; rax==0 (MOUNT_OP_OK) falls through to mount_main_success. rax==1 (MOUNT_OP_ERR_KERNEL) falls straight through (no label, no jmp) into the classify-and-emit block: rdi=[rip+mount_raw_errno_out]; call mount_record_classify_mount_errno (src/mount_record.pdx, #10) -> rax=result_code; `mov r9, rax` (scratch, not otherwise live past this point) then builds the emit call with rcx=r9. Phase 6 (success path, mount_main_success): re-test rbx & 0x8 (Argv::PA_FLAG_DRY_RUN) to choose DRY_RUN vs OK -- mount_op_invoke's own dry-run gate already skipped the syscall internally; this second test only selects which result_code label to print, since mount_op_invoke's return alone cannot distinguish 'dry-run success' from 'real success' (both are MOUNT_OP_OK). Every terminal branch (mount_main_invalid_mount_point, mount_main_m22_no_elevate, mount_main_m22_mint_failed, mount_main_bad_volume_cap, mount_main_narrow_failed, mount_main_emit_mount_op_error, and both success sub-branches) follows the SAME three-step shape: rdi=r15, rsi=r12, rdx=rbx, rcx=<result_code>, r8=<mount_id or 0>, `call mount_pipe_emit_result` (src/pipe_wire.pdx, #9 -- replaces every M2 direct call to MountRecord::mount_record_emit_result); rdi=r13 (audit_id), rsi=<this branch's real exit status>, `call mount_audit_commit` (src/audit_wire.pdx, #8 -- the RESULT record, sharing r13's audit_id with Phase 2's INTENT record); rdi=<same exit status>, jmp mount_main_exit. Every terminal path ends in sys_exit (never returns); a trailing hlt on each path is defensive belt-and-suspenders for the impossible fallthrough, matching every other _start in the paideia-os monorepo's src/user/ tree. No `add reg,[mem]`; every zero-check is cmp reg, 0 (no `test` mnemonic). Labels prefixed mount_main_.",
       block: {
         mov r12, rdi;                       // r12 = argc
         mov r13, rsi;                       // r13 = argv
@@ -199,6 +223,54 @@ module Main = structure {
         mov r15, [r14 + 8];                  // r15 = volume_cap_ptr (Argv::PA_OFF_VOLUME_CAP_PTR)
         mov r12, [r14 + 16];                 // r12 = mount_point_ptr (Argv::PA_OFF_MOUNT_POINT_PTR)
 
+        // ==================================================================
+        // M6 mode dispatch (issues #23/#24). Three new argv surfaces
+        // branch off HERE, before the legacy audit-open + classify +
+        // resolve + mount pipeline below. Each new mode has its own
+        // exit path that:
+        //   1. Opens an audit record (mount_audit_begin) for consistency
+        //      with legacy paths -- op_args is the mount_point_ptr or
+        //      volume_cap_ptr, whichever the surface takes.
+        //   2. Calls the wire helper.
+        //   3. Emits a PdxFsMountRecord with a distinct M6 result_code
+        //      (NO_ELEVATE / SNAPSHOT_NOT_IMPL / DEP_ORDER_NOT_IMPL /
+        //      WRONG_PASSPHRASE / EDQUOT / SNAPSHOT_NOT_FROZEN).
+        //   4. Commits the audit + sys_exits with the branch's real
+        //      exit status.
+        //
+        // Every M6 exit today reaches a documented stub-refusal:
+        //   --all:            DEP_ORDER_NOT_IMPL (dep_graph_wire, exit 3)
+        //   --snapshot-list:  SNAPSHOT_NOT_IMPL   (snap_chain_walk stub, exit 3)
+        //   --snapshot=:      SNAPSHOT_NOT_IMPL   (KERNEL GAP #A, exit 3)
+        //   --passphrase-fd:  falls through to legacy path; the M6
+        //                     unlock hop is wired at Phase 5 (mount_op)
+        //                     rather than here.
+        //
+        // No M6 branch reaches the M2 volume-cap resolve or the M2
+        // mount_op_invoke -- those are legacy-only paths.
+        // ==================================================================
+
+        // --all first (highest precedence: batch-mode overrides
+        // per-invocation flags).
+        mov rax, rbx;
+        and rax, 0x10;                       // PA_FLAG_ALL
+        cmp rax, 0;
+        jne mount_main_m6_all;
+
+        // --snapshot-list next (enumeration-only, no mount).
+        mov rax, rbx;
+        and rax, 0x20;                       // PA_FLAG_SNAPSHOT_LIST
+        cmp rax, 0;
+        jne mount_main_m6_snap_list;
+
+        // --snapshot= next (RO snap mount).
+        mov rax, rbx;
+        and rax, 0x40;                       // PA_FLAG_SNAPSHOT_SET
+        cmp rax, 0;
+        jne mount_main_m6_snap_mount;
+
+        // Fall through to legacy audit + classify + resolve + mount.
+
         // ---- M3 (#8): open the audit record before any dispatch. ---------
         mov rdi, r12;                        // mount_point_ptr
         mov rax, rbx;
@@ -218,27 +290,84 @@ module Main = structure {
         je mount_main_volume_resolve;
 
         // ---- MPC_SYSTEM_PATH (1) or MPC_CROSS_USER (2): needs elevate. ----
-        mov rdi, r12;                        // mount_point_ptr
-        mov rsi, rax;                        // mpc_class
-        call mount_elev_require_system;
+        // M6-002 v1.1.1 (#22 wire-through): route through mint_wire_invoke
+        // (src/mint_wire.pdx) instead of the M3-era mount_elev_require_
+        // system stub. mint_wire_invoke composes the tier-driven elevate
+        // selection with the new 3-arg vol_kind_mint_elevate mint form:
+        // when the process holds no KIND_ELEVATE_CHANNEL cap (today's
+        // landing), it refuses BEFORE the library call and returns
+        // MW_ERR_NO_ELEVATE (1) -- surfaced here as MR_RESULT_NO_ELEVATE
+        // (16). On a legal grant, it writes a fresh KIND_VOLUME slot into
+        // mount_narrowed_slot and returns MW_OK; this arm then jumps
+        // directly to mount_main_mount_op, bypassing volume_cap_resolve
+        // (the raw <volume-cap> URI is unused on the elevated path -- the
+        // minted narrowed slot IS the cap that sys_mount consumes).
+        //
+        // GAP flagged for main: no KIND_BLOCK_DEVICE resolver exists in
+        // this repo (or upstream) that would map a <volume-cap> URI to
+        // the backing dev_cap vol_kind_mint_elevate expects. Passing
+        // rdi=0 is safe TODAY because the refuse-gate inside mint_wire_
+        // invoke fires on every reachable input (no elevate cap held),
+        // so the dev_cap value is never dereferenced. Once cap-seeding
+        // lands and the refuse-gate stops firing, this call site needs a
+        // real dev_cap upstream helper -- see mint_wire.pdx module
+        // header for the cap-seeding hook that would install the KIND_
+        // ELEVATE_CHANNEL slot, and design/tooling/volume-tooling-ux.md
+        // §4.2 for the KIND_BLOCK_DEVICE resolver contract.
+        //
+        // mount_elev_require_system remains defined in src/elevate.pdx
+        // as a legacy stub -- its M4-002 test driver still references
+        // it. Its production call site is REMOVED here.
+        xor rdi, rdi;                        // dev_cap = 0 (documented GAP: no KIND_BLOCK_DEVICE resolver)
+        mov rsi, rax;                        // mpc_class from mount_point_class
+        lea rdx, [rip + mount_narrowed_slot];
+        call mint_wire_invoke;
 
-        cmp rax, 1;                          // MOUNT_ELEV_GRANT
-        je mount_main_volume_resolve;         // real, wired, unreachable at this landing
+        cmp rax, 0;                          // MW_OK
+        je mount_main_mount_op;              // narrowed slot already in place; skip volume_cap_resolve
 
-        // ---- MOUNT_ELEV_DENY (the only value reachable at this landing). -
-      mount_main_elevation_stub:
+        cmp rax, 1;                          // MW_ERR_NO_ELEVATE
+        je mount_main_m22_no_elevate;
+
+        // MW_ERR_LIBPDX_VK (2) or any unrecognised code: mint attempted
+        // but the library refused post-gate. Emit MR_RESULT_MINT_FAILED.
+        jmp mount_main_m22_mint_failed;
+
+      mount_main_m22_no_elevate:
+        // System-tier mount refused because no KIND_ELEVATE_CHANNEL cap
+        // is provisioned for this process (mint_wire.pdx's refuse-gate).
         mov rdi, r15;
         mov rsi, r12;
         mov rdx, rbx;
-        mov rcx, 4;                          // MR_RESULT_ELEVATION_STUB
+        mov rcx, 16;                         // MR_RESULT_NO_ELEVATE
         xor r8, r8;                          // mount_id unused
         call mount_pipe_emit_result;
 
         mov rdi, r13;                        // audit_id
-        mov rsi, 4;                          // exit_status = 4
+        mov rsi, 3;                          // exit_status = 3 (refusal)
         call mount_audit_commit;
 
-        mov rdi, 4;
+        mov rdi, 3;
+        jmp mount_main_exit;
+
+      mount_main_m22_mint_failed:
+        // vol_kind_mint_elevate returned a non-zero LPV_VK_* after the
+        // refuse-gate cleared (unreachable at this landing -- the gate
+        // consumes every system-tier call today -- but wired for the
+        // day cap-seeding installs a real KIND_ELEVATE_CHANNEL slot and
+        // the mint hop itself starts running).
+        mov rdi, r15;
+        mov rsi, r12;
+        mov rdx, rbx;
+        mov rcx, 22;                         // MR_RESULT_MINT_FAILED (NEW at v1.1.1)
+        xor r8, r8;                          // mount_id unused
+        call mount_pipe_emit_result;
+
+        mov rdi, r13;                        // audit_id
+        mov rsi, 3;                          // exit_status = 3 (refusal)
+        call mount_audit_commit;
+
+        mov rdi, 3;
         jmp mount_main_exit;
 
       mount_main_invalid_mount_point:
@@ -365,6 +494,204 @@ module Main = structure {
         call mount_audit_commit;
 
         xor rdi, rdi;                        // status = 0 (OK)
+        jmp mount_main_exit;
+
+        // ==================================================================
+        // M6 handler branches (#23/#24). Reached from the M6 mode dispatch
+        // above (`mount_main_argv_ok`). Each branch:
+        //   1. Opens an audit record via mount_audit_begin (op_args is
+        //      whichever positional the surface takes; a bare "-" via
+        //      mount_main_lit_none when the surface takes none).
+        //   2. Calls its M6 wire helper (dep_graph_wire_sort /
+        //      snapshot_wire_list / snapshot_wire_mount). Every helper
+        //      today reaches a documented stub-refusal per its own header;
+        //      the return code is either ignored (dep-graph / snap-list
+        //      are pure passthroughs to unwired kernel/library stubs and
+        //      the emitted M6 result_code is fixed) or dispatched into
+        //      the MR_RESULT_* taxonomy (snap-mount, which has multiple
+        //      failure modes even at the stubbed landing).
+        //   3. Emits exactly one PdxFsMountRecord via mount_pipe_emit_
+        //      result. When the argv surface omitted volume_cap_ptr or
+        //      mount_point_ptr, the missing slot is filled from the
+        //      module-level mount_main_lit_none literal so the emitter's
+        //      mount_record_strlen loop never dereferences a NULL.
+        //   4. Commits the audit + jmps to the shared mount_main_exit
+        //      epilogue with the branch's real exit_status in rdi.
+        //
+        // Every branch's exit_status is 3 today (all three surfaces
+        // refuse cleanly at this landing). --passphrase-fd has NO M6
+        // branch here -- per the mode-dispatch comment above, it falls
+        // through to the legacy pipeline and its unlock hop is a future
+        // Phase-5 wiring (KERNEL GAP #P2 in src/passphrase_wire.pdx: no
+        // KIND_DEK cap yet).
+        // ==================================================================
+
+      // ---- --all: DEP_ORDER_NOT_IMPL (#24C, dep_graph_wire) ------------
+      mount_main_m6_all:
+        // op_args = "-" (neither positional required).
+        lea rdi, [rip + mount_main_lit_none];
+        xor rsi, rsi;                        // dry_run_flag = 0
+        call mount_audit_begin;
+        mov r13, rax;                        // r13 = audit_id
+
+        // Call the wire helper. Passing entry_count=1 with entries_ptr=0
+        // triggers LPV_ORDER_ERR_NOT_IMPL inside the stub without any
+        // pointer dereference (the stub gates on entry_count alone before
+        // reading anything). The return code is ignored below -- today
+        // every non-empty --all invocation is DEP_ORDER_NOT_IMPL.
+        xor rdi, rdi;                        // entries_ptr = 0
+        mov rsi, 1;                          // entry_count = 1 (triggers NOT_IMPL)
+        xor rdx, rdx;                        // deps_ptr = 0
+        xor rcx, rcx;                        // deps_count = 0
+        xor r8, r8;                          // out_ordered_ptr = 0
+        call dep_graph_wire_sort;
+
+        // Emit with fixed DEP_ORDER_NOT_IMPL. Both positionals may be 0
+        // per the argv parser's --all relax-gate; substitute mount_main_
+        // lit_none for either that is null.
+        mov rdi, r15;
+        cmp rdi, 0;
+        jne mount_main_m6_all_have_vc;
+        lea rdi, [rip + mount_main_lit_none];
+      mount_main_m6_all_have_vc:
+        mov rsi, r12;
+        cmp rsi, 0;
+        jne mount_main_m6_all_have_mp;
+        lea rsi, [rip + mount_main_lit_none];
+      mount_main_m6_all_have_mp:
+        mov rdx, rbx;                        // flags
+        mov rcx, 21;                         // MR_RESULT_DEP_ORDER_NOT_IMPL
+        xor r8, r8;                          // mount_id unused
+        call mount_pipe_emit_result;
+
+        mov rdi, r13;                        // audit_id
+        mov rsi, 3;                          // exit_status = 3
+        call mount_audit_commit;
+
+        mov rdi, 3;
+        jmp mount_main_exit;
+
+      // ---- --snapshot-list: SNAPSHOT_NOT_IMPL (#23, snap_chain_walk) --
+      mount_main_m6_snap_list:
+        // op_args = volume_cap_ptr (or "-" if the caller passed --snapshot-
+        // list with no positional at all, which the argv parser allows via
+        // the mount_argv_ok_short exit -- defense-in-depth substitution).
+        mov rdi, r15;
+        cmp rdi, 0;
+        jne mount_main_m6_sl_have_op;
+        lea rdi, [rip + mount_main_lit_none];
+      mount_main_m6_sl_have_op:
+        xor rsi, rsi;                        // dry_run_flag = 0
+        call mount_audit_begin;
+        mov r13, rax;                        // r13 = audit_id
+
+        // Call the wire helper. snap_chain_walk is a documented stub
+        // (KERNEL GAP #B in src/snapshot_wire.pdx) that returns
+        // LPV_SNAP_ERR_NOT_IMPL for every input; every arg passes through
+        // verbatim. Real superblock read + snap_head_lba extract are a
+        // future wiring; today all-zero args suffice.
+        xor rdi, rdi;                        // volume_cap_slot = 0
+        xor rsi, rsi;                        // snap_head_lba = 0
+        xor rdx, rdx;                        // out_ptr = 0
+        xor rcx, rcx;                        // out_cap = 0
+        xor r8, r8;                          // out_count_ptr = 0
+        call snapshot_wire_list;
+
+        // Emit with fixed SNAPSHOT_NOT_IMPL. --snapshot-list has no mount-
+        // point positional; use "-" for that slot.
+        mov rdi, r15;
+        cmp rdi, 0;
+        jne mount_main_m6_sl_have_vc;
+        lea rdi, [rip + mount_main_lit_none];
+      mount_main_m6_sl_have_vc:
+        lea rsi, [rip + mount_main_lit_none]; // no mount-point on this surface
+        mov rdx, rbx;                        // flags
+        mov rcx, 17;                         // MR_RESULT_SNAPSHOT_NOT_IMPL
+        xor r8, r8;                          // mount_id unused
+        call mount_pipe_emit_result;
+
+        mov rdi, r13;                        // audit_id
+        mov rsi, 3;                          // exit_status = 3
+        call mount_audit_commit;
+
+        mov rdi, 3;
+        jmp mount_main_exit;
+
+      // ---- --snapshot=<slot>: real snapshot_wire_mount dispatch (#23) --
+      mount_main_m6_snap_mount:
+        // op_args = mount_point_ptr (or "-" if somehow null).
+        mov rdi, r12;
+        cmp rdi, 0;
+        jne mount_main_m6_sm_have_op;
+        lea rdi, [rip + mount_main_lit_none];
+      mount_main_m6_sm_have_op:
+        xor rsi, rsi;                        // dry_run_flag = 0
+        call mount_audit_begin;
+        mov r13, rax;                        // r13 = audit_id
+
+        // Load the snap cap slot from ParsedArgv+PA_OFF_SNAPSHOT_SLOT
+        // (offset +24). r14 was dead after Phase 2's argv-struct loads;
+        // reuse it here to lea the struct base, then read the slot.
+        lea r14, [rip + mount_argv_out];
+        mov rdi, [r14 + 24];                 // snap_cap_slot (PA_OFF_SNAPSHOT_SLOT)
+        mov rsi, r12;                        // mount_point_ptr
+        mov rdx, rbx;                        // flags (carries PA_FLAG_RO implicit for --snapshot=)
+        call snapshot_wire_mount;
+        mov r9, rax;                         // r9 = SW_* code
+
+        // Map SW_* -> MR_RESULT_*. Today the only reachable value at this
+        // landing is SW_ERR_KERNEL_NOT_IMPL (1) -- the vol_snapshot_narrow
+        // scaffold accepts the R_VSNAP_READ mask (0x001) legally, so the
+        // NARROW_FAILED arm is wired but unreachable; the FROZEN arm is
+        // reachable only once snap_chain_walk lands (KERNEL GAP #B).
+        cmp r9, 0;                           // SW_OK
+        je mount_main_m6_sm_map_ok;
+        cmp r9, 2;                           // SW_ERR_NARROW_FAILED
+        je mount_main_m6_sm_map_narrow;
+        cmp r9, 3;                           // SW_ERR_SNAP_NOT_FROZEN
+        je mount_main_m6_sm_map_frozen;
+        // 1 (KERNEL_NOT_IMPL), 4 (CONFLICT_WITH_RW), or unrecognised:
+        mov r9, 17;                          // MR_RESULT_SNAPSHOT_NOT_IMPL
+        jmp mount_main_m6_sm_emit;
+      mount_main_m6_sm_map_ok:
+        mov r9, 1;                           // MR_RESULT_OK (unreachable today)
+        jmp mount_main_m6_sm_emit;
+      mount_main_m6_sm_map_narrow:
+        mov r9, 7;                           // MR_RESULT_NARROW_FAILED
+        jmp mount_main_m6_sm_emit;
+      mount_main_m6_sm_map_frozen:
+        mov r9, 18;                          // MR_RESULT_SNAPSHOT_NOT_FROZEN
+
+      mount_main_m6_sm_emit:
+        // volume_cap_ptr is not on the --snapshot= surface; substitute.
+        mov rdi, r15;
+        cmp rdi, 0;
+        jne mount_main_m6_sm_have_vc;
+        lea rdi, [rip + mount_main_lit_none];
+      mount_main_m6_sm_have_vc:
+        mov rsi, r12;                        // mount_point_ptr (required by the surface)
+        cmp rsi, 0;
+        jne mount_main_m6_sm_have_mp;
+        lea rsi, [rip + mount_main_lit_none];
+      mount_main_m6_sm_have_mp:
+        mov rdx, rbx;                        // flags
+        mov rcx, r9;                         // result_code from SW-map
+        xor r8, r8;                          // mount_id unused
+        call mount_pipe_emit_result;
+
+        mov rdi, r13;                        // audit_id
+        // exit_status: 0 on OK (unreachable today), 3 on every refusal.
+        cmp r9, 1;                           // MR_RESULT_OK
+        je mount_main_m6_sm_exit_ok;
+        mov rsi, 3;
+        call mount_audit_commit;
+        mov rdi, 3;
+        jmp mount_main_exit;
+      mount_main_m6_sm_exit_ok:
+        xor rsi, rsi;                        // exit_status = 0
+        call mount_audit_commit;
+        xor rdi, rdi;                        // status = 0
+        jmp mount_main_exit;
 
       mount_main_exit:
         mov rax, 60;                         // SC+ ID 60 = sys_exit

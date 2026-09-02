@@ -1,5 +1,207 @@
 # mount.pdxfs — CHANGELOG
 
+## 1.1.1 — 2026-09-02 (M6-002 wire-through fix — issue #22 completion)
+
+**Patch bump — completes the M6-002 (#22) landing.** The 1.1.0 landing
+of `src/mint_wire.pdx` shipped `mint_wire_invoke` as fully wired inside
+the module but ORPHANED at the call-site level: `src/main.pdx` never
+invoked it, and the system-tier path still called the M3-era
+`mount_elev_require_system` stub (fixed exit 4, `MR_RESULT_
+ELEVATION_STUB`) instead. STATUS.md and this CHANGELOG's own 1.1.0
+entry both claimed "system-tier mounts without a provisioned
+`KIND_ELEVATE_CHANNEL` cap refuse `MW_ERR_NO_ELEVATE` (→
+`MR_RESULT_NO_ELEVATE = 16`) BEFORE the library call" — a claim no
+code path actually made true. 1.1.1 makes it true.
+
+### Landed
+
+- **M6-002 (#22 wire-through)** — `src/main.pdx`'s Phase 3 SYSTEM_PATH
+  / CROSS_USER branch now calls `mint_wire_invoke(dev_cap=0,
+  mpc_class, &mount_narrowed_slot)` instead of `mount_elev_require_
+  system`. Dispatch on the MW return:
+  - `MW_OK` (0) → jump to `mount_main_mount_op` with the minted
+    narrowed slot already in `mount_narrowed_slot` (bypasses
+    `volume_cap_resolve` — the raw `<volume-cap>` URI is unused on
+    the elevated path; the minted slot IS the cap `sys_mount`
+    consumes). Unreachable today.
+  - `MW_ERR_NO_ELEVATE` (1) → `mount_main_m22_no_elevate`: emits
+    `MR_RESULT_NO_ELEVATE = 16`, exit 3. **The one reachable
+    system-tier outcome at this landing** (the refuse-gate fires on
+    every call: no `KIND_ELEVATE_CHANNEL` cap is provisioned).
+  - `MW_ERR_LIBPDX_VK` (2) or unrecognised → `mount_main_m22_mint_
+    failed`: emits **new** `MR_RESULT_MINT_FAILED = 22`, exit 3.
+    Wired but unreachable until the refuse-gate stops firing (i.e.
+    once cap-seeding lands and the mint hop itself starts running).
+- **New `MR_RESULT_MINT_FAILED` code (22)** — added to
+  `src/mount_record.pdx` (constant, `MINT_FAILED` label literal,
+  cmp/je case in `mount_record_emit_result`). Distinct from
+  `MR_RESULT_NO_ELEVATE` (16, pre-library refusal) and
+  `MR_RESULT_NARROW_FAILED` (7, legacy user-tier
+  `volume_cap_resolve` failure).
+
+### Removed from the production path
+
+- `Elevate::mount_elev_require_system` no longer has any call site in
+  `src/main.pdx`. The function itself remains defined in
+  `src/elevate.pdx` (still-returning `MOUNT_ELEV_DENY`) because its
+  M4-002 test driver `tests/test_elevate_system.pdx` still asserts the
+  DENY posture. `MR_RESULT_ELEVATION_STUB` (4) constant + label are
+  retained in `src/mount_record.pdx` for wire-format compatibility
+  with any 1.0.x/1.1.0 record consumer, but no code path in v1.1.1
+  emits code 4 any more.
+
+### Known gap flagged for main
+
+- **No `KIND_BLOCK_DEVICE` resolver.** `mint_wire_invoke` takes a
+  `dev_cap` as its first argument (the backing block device from
+  which a fresh `KIND_VOLUME` cap is minted); no upstream helper
+  exists in this repo (or in `libpdx-volume`) that maps a
+  `<volume-cap>` URI string to the corresponding
+  `KIND_BLOCK_DEVICE` cap slot. `src/main.pdx` passes `rdi = 0` at
+  the call site — safe TODAY because `mint_wire_invoke`'s
+  refuse-gate consumes every reachable system-tier call before
+  `vol_kind_mint_elevate` ever dereferences dev_cap, but the gap
+  becomes load-bearing the day cap-seeding installs a real
+  `KIND_ELEVATE_CHANNEL` slot. **Flagged for a follow-up landing
+  paired with the cap-seeding hook that closes the elevate-cap
+  provisioning gap.**
+
+## 1.1.0 — 2026-09-02 (M6, libpdx-volume v1.1.0 API adoption — issues #21..#24)
+
+**Minor bump — additive API adoption, no wire-format break.** Adopts
+the full libpdx-volume v1.1.0 API surface (LV.M1..M6 landings, issues
+`paideia-os/libpdx-volume#18`..`#31`) plus three new argv surfaces and
+six new `MR_RESULT_*` codes. The pre-existing dry-run and legacy
+non-`--dry-run` paths are byte-for-byte unchanged; every M6 addition
+is either a new argv flag, a new emitter code, or a new wire-through
+helper module. No existing consumer of this tool needs to change.
+
+### Landed
+
+- **M6-001 (#21)** — libpdx-volume v1.1 API cleanup adoption
+  (`src/lpv_errors_wire.pdx`, new). Wraps `lpv_strerror` in a
+  bounded-buffer fd-2 diagnostic helper; the six new `pdxb_sb_get_*`
+  accessors and the banded `LPV_E_*` namespace are consumed directly
+  by the M6 wire modules below (no per-consumer shim). Parents:
+  `libpdx-volume` #18/#19/#20.
+- **M6-002 (#22)** — LV.M2-003 elevate-cap wire-through for
+  `vol_kind_mint_elevate` (`src/mint_wire.pdx`, new). Provides
+  `mint_wire_invoke(dev_cap, mpc_class, out_slot)` composing the
+  elevate-tier selection with the new 3-arg mint form; refuses cleanly
+  with `MW_ERR_NO_ELEVATE` on a system-tier mount without a provisioned
+  `KIND_ELEVATE_CHANNEL` cap (today's posture — parent `libpdx-volume`
+  #23 landed the API, not the broker-endpoint cap seeding).
+  **Post-landing note (1.1.1):** the module itself is fully wired but
+  had no call site in `src/main.pdx` at 1.1.0 — the system-tier path
+  still called the M3-era `mount_elev_require_system` stub instead, so
+  the "refuses with `MW_ERR_NO_ELEVATE` → `MR_RESULT_NO_ELEVATE`"
+  claim above only became true at 1.1.1. See 1.1.1 entry above.
+- **M6-003 (#23)** — LV.M3 snapshots: `--snapshot=<slot>` read-only
+  mount surface + `--snapshot-list` enumeration (`src/snapshot_wire.
+  pdx` new, argv extended, `main.pdx` M6 dispatch). `--snapshot=`
+  narrows to `R_VSNAP_READ` via `vol_snapshot_narrow` and issues a
+  snap-mount kernel op (KERNEL GAP #A: no snap-mount syscall exists
+  yet, so every legal call refuses `SNAPSHOT_NOT_IMPL`).
+  `--snapshot-list` is a passthrough to `snap_chain_walk` (KERNEL GAP
+  #B in libpdx-volume: the walker is itself a stub returning
+  `LPV_SNAP_ERR_NOT_IMPL` for every input). The FROZEN gate
+  (`snapshot_wire_check_frozen`) is wired but unreachable until GAP #B
+  closes. Parents: `libpdx-volume` #25/#26.
+- **M6-004 (#24, part A)** — LV.M5 `--passphrase-fd=<n>` argv surface
+  + KEK-derive + DEK-unwrap composition (`src/passphrase_wire.pdx`,
+  new). `passphrase_wire_read` / `passphrase_wire_unlock` /
+  `passphrase_wire_wipe` are real bodies over the v1.1 crypto helpers
+  (`pdxb_kek_derive`, `pdxb_dek_unwrap`); the mount-time hook that
+  calls them lives at Phase 5 (mount_op) and is deferred until (a) the
+  kernel-side `KIND_DEK` cap kind lands (GAP #P2) and (b)
+  `dispatch_mount` is wired for real (already-flagged gap since M2).
+  The argv flag is fully parsed and the value is stashed in
+  `ParsedArgv.passphrase_fd` (offset +32). Parents: `libpdx-volume`
+  #29/#30.
+- **M6-005 (#24, part B)** — LV.M4 quota enforcement wrapper
+  (`src/quota_wire.pdx`, new). `quota_wire_install` is a documented
+  stub returning `QW_OK` (no-op) or `QW_ERR_NOT_IMPL` per superblock
+  `PDXB_FLAG_HAS_QUOTA` bit (GAP #Q1: no `KIND_PDXFS_QUOTA` cap kind
+  kernel-side). `quota_wire_check_or_refuse` is a REAL body over
+  `pdxb_quota_check` with the tool's `EDQUOT`-style refusal contract;
+  call sites appear once `mount.pdxfs` (or a companion FS-write
+  daemon) grows a real write path (GAP #Q2). Parent: `libpdx-volume`
+  #28.
+- **M6-006 (#24, part C)** — LV.M6 dep-graph refusal (`--all` argv
+  surface, `src/dep_graph_wire.pdx`, new). `dep_graph_wire_sort` +
+  `dep_graph_wire_parse_block` wrap `mount_table_sort_by_deps` +
+  `mount_deps_parse`. Today's posture: any non-empty `--all`
+  invocation reaches `LPV_ORDER_ERR_NOT_IMPL` (0x0A04), mapped to
+  `MR_RESULT_DEP_ORDER_NOT_IMPL` (21, new). Refusal is BEFORE any
+  real mount happens, matching the ticket's "any missing
+  mount-requires dep refuses the whole --all invocation" contract.
+  Parent: `libpdx-volume` #31.
+
+### Argv surface additions
+
+- `--all` — batch mount every volume in a caller-visible manifest
+  (source shape agreed with the future `mountall.pdxfs` tool). Today
+  refuses `DEP_ORDER_NOT_IMPL`.
+- `--snapshot=<slot>` — mount a `KIND_VOLUME_SNAPSHOT` cap read-only
+  at `<mount-point>`; PA_FLAG_RO is stamped implicitly. Today refuses
+  `SNAPSHOT_NOT_IMPL`.
+- `--snapshot-list` — enumerate the snap chain anchored at a
+  `<volume-cap>`'s superblock; today refuses `SNAPSHOT_NOT_IMPL`.
+- `--passphrase-fd=<n>` — read a passphrase from fd `<n>` at mount
+  time (used by the future encrypted-volume mount hop). Parsed and
+  stashed today; consumed at Phase 5 once the surrounding gaps close.
+
+### New MR_RESULT_* codes (16..21)
+
+Six additions to the `PdxFsMountRecord@0.1` `result_code` vocabulary,
+each with its own literal in `src/mount_record.pdx`'s emitter:
+
+- `NO_ELEVATE` (16) — system-tier mount without a provisioned
+  `KIND_ELEVATE_CHANNEL` cap (surfaces via `mint_wire_invoke` and, in
+  future, via any elevate-gated wire helper).
+- `SNAPSHOT_NOT_IMPL` (17) — snap-mount syscall / snap_chain_walk
+  stub (`--snapshot=` and `--snapshot-list`).
+- `SNAPSHOT_NOT_FROZEN` (18) — FROZEN gate refusal (wired but
+  unreachable at this landing).
+- `WRONG_PASSPHRASE` (19) — AEAD tag mismatch on DEK unwrap
+  (`LPV_CRYPTO_ERR_TAG_MISMATCH`, wired via `passphrase_wire_unlock`;
+  no call site until the mount-op hop closes).
+- `EDQUOT` (20) — quota-hard-exceeded or grace-expired refusal from
+  `quota_wire_check_or_refuse` (call site awaits a real write path).
+- `DEP_ORDER_NOT_IMPL` (21) — `--all` refusal from
+  `dep_graph_wire_sort`.
+
+### Known deferred substrate (delta from 1.0.x)
+
+- **KERNEL GAP #A (snap-mount syscall)**: no syscall analogous to
+  `sys_mount` that accepts a `KIND_VOLUME_SNAPSHOT` slot and stamps
+  the resulting mount-table row with `snap_id + read-only`. Every
+  `--snapshot=` call refuses `SNAPSHOT_NOT_IMPL` until this lands.
+- **KERNEL GAP #B (snap_chain_walk)**: `libpdx-volume` v1.1.0's
+  walker is itself a stub. Every `--snapshot-list` call refuses
+  `SNAPSHOT_NOT_IMPL` until this lands upstream.
+- **GAP #P1 (`pdxb_sb_get_dek_nonce` accessor)**: no getter for the
+  wrapped-DEK's AEAD nonce at v1.1.0. `src/passphrase_wire.pdx`
+  reads it via direct offset arithmetic on the caller-supplied
+  superblock buffer (`PW_D_OFF_DEK_NONCE = 256`). **Flagged for
+  libpdx-volume v1.1.x follow-up.**
+- **GAP #P2 (`KIND_DEK` cap kind)**: no kernel-side cap kind for a
+  32-byte unwrapped DEK. Every unlocked DEK stays in .bss scratch
+  today; the "install as cap" step at the bottom of
+  `passphrase_wire_unlock` is a future landing.
+- **GAP #Q1 (`KIND_PDXFS_QUOTA` cap kind)**: no kernel-side cap kind
+  to seed the FS layer's per-mount quota-table cache. Every mount
+  with `PDXB_FLAG_HAS_QUOTA` set silently proceeds without quota
+  enforcement at this landing.
+- **GAP #Q2 (`mount.pdxfs` write path)**: no in-tool write path yet.
+  `quota_wire_check_or_refuse` is a real body with no production call
+  sites; a future landing wires it into whichever component grows the
+  first write op.
+- **`libpdx-elevate` broker-endpoint cap**: unchanged since M3-001.
+  Every system-tier mount observes `NO_ELEVATE` (16) at v1.1.1 (was
+  `ELEVATION_STUB` (4) at 1.1.0 due to the #22 orphan-wiring gap
+  fixed in 1.1.1).
+
 ## 1.0.1 — 2026-09-01 (paideia-os#1976/#1977 satellite-embedding wiring)
 
 **Build tooling only, no source/wire-format change.** `tools/build.sh`

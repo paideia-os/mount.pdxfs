@@ -154,6 +154,32 @@ module MountRecord = structure {
   pub let MR_RESULT_ENOSYS              : u64 = 14
   pub let MR_RESULT_AUDIT_FAIL          : u64 = 15
 
+  // --- mount.pdxfs.M6 (issues #21/#22/#23/#24) failure-taxonomy
+  //     additions -- six new codes for the v1.1 adoption surface.
+  //     A seventh (MR_RESULT_MINT_FAILED, 22) was added at v1.1.1
+  //     when the M6-002 (#22) wire-through fix landed; see this
+  //     module's own MR_RESULT_MINT_FAILED comment block below for
+  //     the per-code rationale. See CHANGELOG.md "1.1.0" (six codes)
+  //     and "1.1.1" (the seventh) for the full write-up per code. --
+  pub let MR_RESULT_NO_ELEVATE          : u64 = 16
+  pub let MR_RESULT_SNAPSHOT_NOT_IMPL   : u64 = 17
+  pub let MR_RESULT_SNAPSHOT_NOT_FROZEN : u64 = 18
+  pub let MR_RESULT_WRONG_PASSPHRASE    : u64 = 19
+  pub let MR_RESULT_EDQUOT              : u64 = 20
+  pub let MR_RESULT_DEP_ORDER_NOT_IMPL  : u64 = 21
+
+  // --- mount.pdxfs.M6-002 (#22 wire-through v1.1.1) addition.
+  //     MW_ERR_LIBPDX_VK (mint_wire.pdx: vol_kind_mint_elevate returned
+  //     a non-zero LPV_VK_* after clearing the refuse-gate) surfaces as
+  //     this code. Distinct from MR_RESULT_NO_ELEVATE (16) which is the
+  //     "elevate cap never provisioned" refusal BEFORE the library call,
+  //     and distinct from MR_RESULT_NARROW_FAILED (7) which is the
+  //     legacy user-tier volume_cap_resolve narrow-failed path -- this
+  //     new code is the elevated system-tier mint's own failure signal,
+  //     wired but unreachable today (the refuse-gate consumes every
+  //     system-tier call until KIND_ELEVATE_CHANNEL cap-seeding lands).
+  pub let MR_RESULT_MINT_FAILED         : u64 = 22
+
   pub let mr_lit_result_code     : [u8; 16] = ", result_code: \0"
   pub let mr_lit_result_code_len : u64 = 15
 
@@ -206,6 +232,30 @@ module MountRecord = structure {
 
   pub let mr_lit_result_audit_fail     : [u8; 11] = "AUDIT_FAIL\0"
   pub let mr_lit_result_audit_fail_len : u64 = 10
+
+  // --- M6 (issues #21/#22/#23/#24) label literals. Lengths verified
+  //     via `python3 -c "print(len(...))"`. ------------------------------
+  pub let mr_lit_result_no_elevate     : [u8; 11] = "NO_ELEVATE\0"
+  pub let mr_lit_result_no_elevate_len : u64 = 10
+
+  pub let mr_lit_result_snap_not_impl     : [u8; 18] = "SNAPSHOT_NOT_IMPL\0"
+  pub let mr_lit_result_snap_not_impl_len : u64 = 17
+
+  pub let mr_lit_result_snap_not_frozen     : [u8; 20] = "SNAPSHOT_NOT_FROZEN\0"
+  pub let mr_lit_result_snap_not_frozen_len : u64 = 19
+
+  pub let mr_lit_result_wrong_pass     : [u8; 18] = "WRONG_PASSPHRASE\0\0"
+  pub let mr_lit_result_wrong_pass_len : u64 = 16
+
+  pub let mr_lit_result_edquot     : [u8; 7] = "EDQUOT\0"
+  pub let mr_lit_result_edquot_len : u64 = 6
+
+  pub let mr_lit_result_dep_notimpl     : [u8; 19] = "DEP_ORDER_NOT_IMPL\0"
+  pub let mr_lit_result_dep_notimpl_len : u64 = 18
+
+  // --- M6-002 (#22 wire-through v1.1.1) MINT_FAILED literal. ------------
+  pub let mr_lit_result_mint_failed     : [u8; 12] = "MINT_FAILED\0"
+  pub let mr_lit_result_mint_failed_len : u64 = 11
 
   pub let mr_lit_mount_id     : [u8; 13] = ", mount_id: \0"
   pub let mr_lit_mount_id_len : u64 = 12
@@ -527,7 +577,7 @@ module MountRecord = structure {
   pub let mount_record_emit_result : (u64, u64, u64, u64, u64) -> () !{mem, sysreg} @{fs} =
     fn (volume_cap_ptr: u64) (mount_point_ptr: u64) (flags: u64) (result_code: u64) (mount_id: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "mount.pdxfs.M2 (#4/#5/#6) + M3-004 (#10): mount_record_emit_result entry point. SysV callee-save discipline: push rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any of them -- popped in reverse order before the single `ret`. rbx=volume_cap_ptr, r12=mount_point_ptr, r13=flags, r14=result_code, r15=mount_id, all now-saved callee-save registers surviving the nested `call mount_record_strlen` / `call mount_record_print_decimal` invocations and every `syscall` (both callees clobber only caller-save registers per their own justifications; SYSCALL preserves callee-save registers per amd64 fast-syscall convention). Segments 1-6 are byte-for-byte the same shape as mount_record_emit_dry_run's own segments 1-6, with segment 6 now delegating to `call mount_record_print_decimal` (rdi=r13) instead of an inlined div loop. Segment 7: sys_write(1, mr_lit_result_code, 15). Segment 8, extended at M3-004 (#10) from four to fifteen cases: a cmp/je chain over r14 against 0/1/2/4/5/6/7/8/9/10/11/12/13/14/15 selects one of fifteen (lit_ptr, lit_len) pairs -- mr_lit_result_dry_run/7 (0), mr_lit_result_ok/2 (1), mr_lit_result_elevation/18 (2), mr_lit_result_elevation_stub/14 (4), mr_lit_result_invalid_mount_point/19 (5), mr_lit_result_bad_volume_cap/14 (6), mr_lit_result_narrow_failed/13 (7), mr_lit_result_einval_backend/14 (8), mr_lit_result_einval_mplen/13 (9), mr_lit_result_einval_devlen/14 (10), mr_lit_result_unimpl_backend/14 (11), mr_lit_result_mount_fail/10 (12), mr_lit_result_efault/6 (13), mr_lit_result_enosys/6 (14), mr_lit_result_audit_fail/10 (15) -- with value 3 (MR_RESULT_KERNEL_ERROR) and any other unrecognised value both falling through to the unconditional `jmp mount_mr_er_lit_kernel_error` at the chain's end (defensive catch-all, never silently printing nothing), then one sys_write of the selected pair via the shared mount_mr_er_lit_write tail. Segment 9: `cmp r14, 1 (MR_RESULT_OK); jne mount_mr_er_close` gates the ENTIRE mount_id sub-segment -- on a match, sys_write(1, mr_lit_mount_id, 12) then `call mount_record_print_decimal` (rdi=r15). Segment 10 (mount_mr_er_close): sys_write(1, mr_lit_close, 3). Pops r15/r14/r13/r12/rbx (reverse push order) and returns. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mount_mr_er_.",
+      justification: "mount.pdxfs.M2 (#4/#5/#6) + M3-004 (#10) + M6-002 v1.1.1 (#22 mint-wire-through): mount_record_emit_result entry point. SysV callee-save discipline: push rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any of them -- popped in reverse order before the single `ret`. rbx=volume_cap_ptr, r12=mount_point_ptr, r13=flags, r14=result_code, r15=mount_id, all now-saved callee-save registers surviving the nested `call mount_record_strlen` / `call mount_record_print_decimal` invocations and every `syscall` (both callees clobber only caller-save registers per their own justifications; SYSCALL preserves callee-save registers per amd64 fast-syscall convention). Segments 1-6 are byte-for-byte the same shape as mount_record_emit_dry_run's own segments 1-6, with segment 6 now delegating to `call mount_record_print_decimal` (rdi=r13) instead of an inlined div loop. Segment 7: sys_write(1, mr_lit_result_code, 15). Segment 8, extended at M3-004 (#10) from four to fifteen cases: a cmp/je chain over r14 against 0/1/2/4/5/6/7/8/9/10/11/12/13/14/15 selects one of fifteen (lit_ptr, lit_len) pairs -- mr_lit_result_dry_run/7 (0), mr_lit_result_ok/2 (1), mr_lit_result_elevation/18 (2), mr_lit_result_elevation_stub/14 (4), mr_lit_result_invalid_mount_point/19 (5), mr_lit_result_bad_volume_cap/14 (6), mr_lit_result_narrow_failed/13 (7), mr_lit_result_einval_backend/14 (8), mr_lit_result_einval_mplen/13 (9), mr_lit_result_einval_devlen/14 (10), mr_lit_result_unimpl_backend/14 (11), mr_lit_result_mount_fail/10 (12), mr_lit_result_efault/6 (13), mr_lit_result_enosys/6 (14), mr_lit_result_audit_fail/10 (15) -- with value 3 (MR_RESULT_KERNEL_ERROR) and any other unrecognised value both falling through to the unconditional `jmp mount_mr_er_lit_kernel_error` at the chain's end (defensive catch-all, never silently printing nothing), then one sys_write of the selected pair via the shared mount_mr_er_lit_write tail. Segment 9: `cmp r14, 1 (MR_RESULT_OK); jne mount_mr_er_close` gates the ENTIRE mount_id sub-segment -- on a match, sys_write(1, mr_lit_mount_id, 12) then `call mount_record_print_decimal` (rdi=r15). Segment 10 (mount_mr_er_close): sys_write(1, mr_lit_close, 3). Pops r15/r14/r13/r12/rbx (reverse push order) and returns. No `add reg,[mem]`. No `test` mnemonic. Labels prefixed mount_mr_er_.",
       block: {
         push rbx;
         push r12;
@@ -622,6 +672,20 @@ module MountRecord = structure {
         je mount_mr_er_lit_enosys;
         cmp r14, 15;                        // MR_RESULT_AUDIT_FAIL
         je mount_mr_er_lit_audit_fail;
+        cmp r14, 16;                        // MR_RESULT_NO_ELEVATE (M6)
+        je mount_mr_er_lit_no_elevate;
+        cmp r14, 17;                        // MR_RESULT_SNAPSHOT_NOT_IMPL (M6)
+        je mount_mr_er_lit_snap_not_impl;
+        cmp r14, 18;                        // MR_RESULT_SNAPSHOT_NOT_FROZEN (M6)
+        je mount_mr_er_lit_snap_not_frozen;
+        cmp r14, 19;                        // MR_RESULT_WRONG_PASSPHRASE (M6)
+        je mount_mr_er_lit_wrong_pass;
+        cmp r14, 20;                        // MR_RESULT_EDQUOT (M6)
+        je mount_mr_er_lit_edquot;
+        cmp r14, 21;                        // MR_RESULT_DEP_ORDER_NOT_IMPL (M6)
+        je mount_mr_er_lit_dep_notimpl;
+        cmp r14, 22;                        // MR_RESULT_MINT_FAILED (M6-002 #22 v1.1.1)
+        je mount_mr_er_lit_mint_failed;
         jmp mount_mr_er_lit_kernel_error;   // MR_RESULT_KERNEL_ERROR (3) or unrecognised
 
       mount_mr_er_lit_dry_run:
@@ -697,6 +761,41 @@ module MountRecord = structure {
       mount_mr_er_lit_audit_fail:
         lea rsi, [rip + mr_lit_result_audit_fail];
         mov rdx, 10;                        // mr_lit_result_audit_fail_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_no_elevate:
+        lea rsi, [rip + mr_lit_result_no_elevate];
+        mov rdx, 10;                        // mr_lit_result_no_elevate_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_snap_not_impl:
+        lea rsi, [rip + mr_lit_result_snap_not_impl];
+        mov rdx, 17;                        // mr_lit_result_snap_not_impl_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_snap_not_frozen:
+        lea rsi, [rip + mr_lit_result_snap_not_frozen];
+        mov rdx, 19;                        // mr_lit_result_snap_not_frozen_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_wrong_pass:
+        lea rsi, [rip + mr_lit_result_wrong_pass];
+        mov rdx, 16;                        // mr_lit_result_wrong_pass_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_edquot:
+        lea rsi, [rip + mr_lit_result_edquot];
+        mov rdx, 6;                         // mr_lit_result_edquot_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_dep_notimpl:
+        lea rsi, [rip + mr_lit_result_dep_notimpl];
+        mov rdx, 18;                        // mr_lit_result_dep_notimpl_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_mint_failed:
+        lea rsi, [rip + mr_lit_result_mint_failed];
+        mov rdx, 11;                        // mr_lit_result_mint_failed_len
         jmp mount_mr_er_lit_write;
 
       mount_mr_er_lit_kernel_error:

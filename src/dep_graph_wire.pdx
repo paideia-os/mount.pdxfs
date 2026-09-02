@@ -1,0 +1,146 @@
+// src/dep_graph_wire.pdx — mount.pdxfs.M6-006 (#24 part C) — --all
+// dependency-ordered mount surface.
+//
+// ----------------------------------------------------------------------
+// The --all argv surface
+// ----------------------------------------------------------------------
+//
+//   mount.pdxfs --all
+//       Mount every volume declared in a caller-visible "mount all"
+//       manifest (source shape agreed with mountall.pdxfs when that
+//       tool lands -- for now, a placeholder). Volumes are mounted in
+//       dependency order per libpdx-volume.mount_table_sort_by_deps.
+//       If any mount-requires dep is missing from the resulting
+//       table, the whole --all invocation refuses BEFORE any real
+//       mount happens.
+//
+// ----------------------------------------------------------------------
+// The libpdx-volume v1.1.0 stub this wraps
+// ----------------------------------------------------------------------
+//
+// libpdx-volume#31 landed the wire format + parser + a topo-sort
+// scaffold. The scaffold (`mount_table_sort_by_deps` in that repo's
+// src/mount_deps.pdx) returns:
+//
+//   - LPV_ORDER_OK (0) for entry_count == 0 (trivial empty-list case)
+//   - LPV_ORDER_ERR_NOT_IMPL (0x0A04) for every non-empty input
+//
+// The `_NOT_IMPL` sentinel is DELIBERATELY distinct from
+// `LPV_ORDER_ERR_CYCLE` (0x0A01) so callers can tell "algorithm
+// pending" from "real cycle detected". This module preserves that
+// distinction: `dep_graph_wire_sort` returns:
+//
+//   DGW_OK             (0) - sort succeeded (empty list, or real sort
+//                             once landed)
+//   DGW_ERR_NOT_IMPL   (1) - algorithm not yet implemented (today's
+//                             posture for any non-empty --all invocation)
+//   DGW_ERR_CYCLE      (2) - real cycle detected (future landing)
+//   DGW_ERR_BAD_MAGIC  (3) - a dep-list block has a bad PDDP magic
+//
+// main.pdx's --all dispatch treats DGW_ERR_NOT_IMPL as a clean refusal
+// (matching the ticket instruction: "today `--all` refuses cleanly
+// with LPV_ORDER_ERR_NOT_IMPL"), mapping it to MR_RESULT_DEP_ORDER_NOT_IMPL.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg,[mem]`. No `test`; every zero-check is `cmp reg, 0`.
+// Reserved-label discipline: every branch label prefixed `mount_dgw_`.
+//
+// Upstream: paideia-satellites/libpdx-volume v1.1.0 (issue #31);
+// design/tooling/volume-tooling-ux.md §4.9 (mount-all surface).
+
+module DepGraphWire = structure {
+
+  // --- Return codes. -----------------------------------------------------
+  pub let DGW_OK              : u64 = 0
+  pub let DGW_ERR_NOT_IMPL    : u64 = 1
+  pub let DGW_ERR_CYCLE       : u64 = 2
+  pub let DGW_ERR_BAD_MAGIC   : u64 = 3
+
+  // ==========================================================================
+  // dep_graph_wire_sort(entries_ptr, entry_count, deps_ptr, deps_count,
+  //                     out_ordered_ptr) -> u64
+  //     (DGW_OK | DGW_ERR_NOT_IMPL | DGW_ERR_CYCLE | DGW_ERR_BAD_MAGIC)
+  //
+  // Thin adapter over mount_table_sort_by_deps: forwards all five
+  // arguments verbatim (SysV positions match), maps the return.
+  // Same shape as SnapshotWire::snapshot_wire_list -- pure adapter,
+  // no push/pop, no scratch buffers.
+  // ==========================================================================
+  pub let dep_graph_wire_sort : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (entries_ptr: u64) (entry_count: u64) (deps_ptr: u64) (deps_count: u64) (out_ordered_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M6-006 (#24C): dep_graph_wire_sort entry point. Passthrough to mount_table_sort_by_deps. call mount_table_sort_by_deps (5 args already in SysV rdi/rsi/rdx/rcx/r8). Map return: cmp rax,0 (LPV_ORDER_OK); je ok. mov r10,0x0A04 (LPV_ORDER_ERR_NOT_IMPL); cmp rax,r10; je notimpl. mov r10,0x0A01 (LPV_ORDER_ERR_CYCLE); cmp rax,r10; je cycle. mov r10,0x0A02 (LPV_ORDER_ERR_BAD_MAGIC); cmp rax,r10; je bad_magic. Default: DGW_ERR_NOT_IMPL. ok: xor rax,rax; ret. notimpl: mov rax,1; ret. cycle: mov rax,2; ret. bad_magic: mov rax,3; ret. No push/pop. No `add reg,[mem]`; no `test`. Labels prefixed mount_dgw_.",
+      block: {
+        call mount_table_sort_by_deps;
+
+        cmp rax, 0;                          // LPV_ORDER_OK
+        je mount_dgw_ok;
+
+        mov r10, 0x0A04;                     // LPV_ORDER_ERR_NOT_IMPL
+        cmp rax, r10;
+        je mount_dgw_notimpl;
+
+        mov r10, 0x0A01;                     // LPV_ORDER_ERR_CYCLE
+        cmp rax, r10;
+        je mount_dgw_cycle;
+
+        mov r10, 0x0A02;                     // LPV_ORDER_ERR_BAD_MAGIC
+        cmp rax, r10;
+        je mount_dgw_bad_magic;
+
+        mov rax, 1;                          // DGW_ERR_NOT_IMPL (default)
+        ret;
+
+      mount_dgw_ok:
+        xor rax, rax;                        // DGW_OK
+        ret;
+
+      mount_dgw_notimpl:
+        mov rax, 1;                          // DGW_ERR_NOT_IMPL
+        ret;
+
+      mount_dgw_cycle:
+        mov rax, 2;                          // DGW_ERR_CYCLE
+        ret;
+
+      mount_dgw_bad_magic:
+        mov rax, 3;                          // DGW_ERR_BAD_MAGIC
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // dep_graph_wire_parse_block(block_ptr, out_ptr, out_cap,
+  //                            out_count_ptr) -> u64
+  //     (DGW_OK | DGW_ERR_BAD_MAGIC)
+  //
+  // Thin adapter over libpdx-volume.mount_deps_parse. Same SysV
+  // positions, same passthrough shape.
+  //
+  // Callers use this to decode one 4KiB dep-list block into an array
+  // of 128-byte per-dep summaries (each entry's mount-before /
+  // mount-after / mount-requires kind + UTF-8 mount path), before
+  // handing the summary array to dep_graph_wire_sort above.
+  // ==========================================================================
+  pub let dep_graph_wire_parse_block : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (block_ptr: u64) (out_ptr: u64) (out_cap: u64) (out_count_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M6-006 (#24C): dep_graph_wire_parse_block entry point. Passthrough to mount_deps_parse (4 args, SysV positions match). call mount_deps_parse. cmp rax,0; je ok. mov r10,0x0A02 (LPV_ORDER_ERR_BAD_MAGIC); cmp rax,r10; je bad_magic. Default: DGW_ERR_BAD_MAGIC (safe fallback). ok: xor rax,rax; ret. bad_magic: mov rax,3; ret. No push/pop. No `add reg,[mem]`; no `test`. Labels prefixed mount_dgw_pb_.",
+      block: {
+        call mount_deps_parse;
+
+        cmp rax, 0;
+        je mount_dgw_pb_ok;
+
+        mov rax, 3;                          // DGW_ERR_BAD_MAGIC
+        ret;
+
+      mount_dgw_pb_ok:
+        xor rax, rax;                        // DGW_OK
+        ret;
+      }
+    }
+}

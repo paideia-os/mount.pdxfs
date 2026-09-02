@@ -1,0 +1,234 @@
+// src/snapshot_wire.pdx — mount.pdxfs.M6-003 (#23) — --snapshot=<cap>
+// read-only mount surface + --snapshot-list enumeration.
+//
+// ----------------------------------------------------------------------
+// The two new argv surfaces this module implements
+// ----------------------------------------------------------------------
+//
+//   mount.pdxfs --snapshot=<snap-cap> <mount-point>
+//       Mount a KIND_VOLUME_SNAPSHOT capability read-only at
+//       <mount-point>. `--ro` is implicit (refuse if `--rw` is also
+//       given). The snap cap is first narrowed to R_VSNAP_READ via
+//       libpdx-volume.vol_snapshot_narrow, then passed to a
+//       snap-mount kernel op (does not exist today -- see gaps below).
+//
+//   mount.pdxfs --snapshot-list <volume-cap>
+//       Enumerate the snap chain anchored at <volume-cap>'s
+//       superblock.snap_head field, printing one line per snap in
+//       chain order (snap_id, created_at_ns, retention_policy). No
+//       mount performed. Uses libpdx-volume.snap_chain_walk.
+//
+// ----------------------------------------------------------------------
+// Kernel-side gaps this module documents and works around
+// ----------------------------------------------------------------------
+//
+//   KERNEL GAP #A: KIND_VOLUME_SNAPSHOT (0x1A1) is a libpdx-volume-side
+//     ordinal but has no matching kernel-side cap kind at any landing
+//     of paideia-os monorepo as of R90-XREPO wave. libpdx-volume's own
+//     `vol_snapshot_mint` / `pdxb_snap_create` are documented stubs
+//     returning LPV_SNAP_ERR_NOT_IMPLEMENTED (0x0701) until that lands.
+//     A "snap-mount" syscall (analogous to sys_mount but taking a
+//     KIND_VOLUME_SNAPSHOT slot instead of a KIND_VOLUME slot, and
+//     stamping the resulting mount table row with `snap_id` and the
+//     read-only flag) does not exist either. This module's
+//     `snapshot_wire_mount` therefore always returns
+//     SW_ERR_KERNEL_NOT_IMPL until both land.
+//
+//   KERNEL GAP #B: snap_chain_walk is a libpdx-volume-side stub. Per
+//     that repo's own note (src/vol_snapshot.pdx module header), the
+//     walker needs one of (a) an in-memory block cache the library
+//     can peek into, (b) a caller-supplied read-block callback, or
+//     (c) cap-invoke through the volume cap -- none of which is
+//     scaffolded at v1.1.0. The stub returns LPV_SNAP_ERR_NOT_IMPL
+//     (0x0701) for every input, so `snapshot_wire_list` here is a
+//     documented passthrough of that sentinel.
+//
+// ----------------------------------------------------------------------
+// FROZEN gate -- checked once snap_record_parse can be reached
+// ----------------------------------------------------------------------
+//
+// The issue brief asks that a snap must be FROZEN before mount
+// succeeds. The FROZEN bit is bit 0 of `record_flags` in the
+// SnapRecord summary (libpdx-volume src/vol_snapshot.pdx, offset
+// SNAP_OFF_RECORD_FLAGS = 16). `snapshot_wire_check_frozen` below
+// isolates that check. Reachable only once snap_chain_walk (or a
+// direct snap_record_parse over a caller-fetched record buffer) can
+// hand us a summary; today every call site above refuses with
+// KERNEL_NOT_IMPL before the check would fire, so this helper is
+// wired but unreachable in practice.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg,[mem]`. No `test`; every zero-check is `cmp reg, 0`.
+// Reserved-label discipline: every branch label prefixed `mount_sw_`.
+//
+// Upstream: paideia-satellites/libpdx-volume v1.1.0 (issues #25, #26);
+// design/tooling/volume-tooling-ux.md §4.6 (snapshot mount surface).
+
+module SnapshotWire = structure {
+
+  // --- Return codes. -----------------------------------------------------
+  pub let SW_OK                     : u64 = 0
+  pub let SW_ERR_KERNEL_NOT_IMPL    : u64 = 1
+  pub let SW_ERR_NARROW_FAILED      : u64 = 2
+  pub let SW_ERR_SNAP_NOT_FROZEN    : u64 = 3
+  pub let SW_ERR_CONFLICT_WITH_RW   : u64 = 4
+
+  // --- Narrow ops mask: R_VSNAP_READ only. -------------------------------
+  //     libpdx-volume/src/vol_snapshot.pdx: R_VSNAP_READ = 0x001,
+  //     within VSNAP_OPS_VALID_MASK (0x00F). Using bit 0 as the ops-
+  //     mask bit matches vol_snapshot_narrow's own bits-0..3-legal
+  //     convention.
+  pub let SW_OPS_MASK_READ_ONLY     : u64 = 0x001
+
+  // --- FROZEN bit in SnapRecord.record_flags (summary offset 16). ---
+  pub let SW_SNAP_FLAG_FROZEN       : u64 = 0x1
+
+  // --- .bss scratch: narrowed snap-cap slot output. ---------------------
+  pub let mut mount_sw_narrowed_slot : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // snapshot_wire_check_frozen(snap_summary_ptr) -> u64
+  //     (1 = frozen, 0 = not frozen -- caller refuses on 0)
+  //
+  //   rdi = snap_summary_ptr  (SNAP_SUMMARY_BYTES-sized summary
+  //                             written by libpdx-volume.snap_record_parse)
+  //
+  // Reads SNAP_OFF_RECORD_FLAGS (+16), masks with SW_SNAP_FLAG_FROZEN
+  // (bit 0), returns the bit. Pure leaf.
+  // ==========================================================================
+  pub let snapshot_wire_check_frozen : (u64) -> u64 !{mem} @{} =
+    fn (snap_summary_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M6-003 (#23): snapshot_wire_check_frozen entry point. Pure leaf. mov rax,[rdi+16] (SNAP_OFF_RECORD_FLAGS); and rax,1 (SW_SNAP_FLAG_FROZEN, small imm); ret. No `add reg,[mem]`; no `test`. Labels: none needed.",
+      block: {
+        mov rax, [rdi + 16];                 // SNAP_OFF_RECORD_FLAGS
+        and rax, 0x1;                        // SW_SNAP_FLAG_FROZEN
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // snapshot_wire_mount(snap_cap_slot, mount_point_ptr, flags) -> u64
+  //     (SW_OK | SW_ERR_CONFLICT_WITH_RW | SW_ERR_NARROW_FAILED |
+  //      SW_ERR_SNAP_NOT_FROZEN | SW_ERR_KERNEL_NOT_IMPL)
+  //
+  //   rdi = snap_cap_slot     (KIND_VOLUME_SNAPSHOT cap slot from the
+  //                             argv parser's --snapshot= value)
+  //   rsi = mount_point_ptr   (NUL-terminated target path)
+  //   rdx = flags             (Argv::ParsedArgv.flags -- the module
+  //                             checks bit 0/RW conflict here, then
+  //                             passes the whole word through)
+  //
+  // Step 1: refuse if the caller passed both --snapshot= and --rw
+  //   (Argv::PA_FLAG_RO = 0x1 -- a snap mount is read-only-only). The
+  //   argv layer enforces --rw is bit-inverted, so a snap flag WITHOUT
+  //   PA_FLAG_RO indicates an implicit RW request that this call must
+  //   refuse. This is a deliberately narrow gate -- the argv parser
+  //   is what stamps PA_FLAG_RO implicitly whenever --snapshot= is
+  //   present, so this check is a defense-in-depth belt rather than
+  //   the primary enforcement point.
+  // Step 2: narrow the snap cap to R_VSNAP_READ via vol_snapshot_narrow.
+  //   On LPV_SNAP_ERR_BAD_OPS_MASK (0x0705) or any other non-zero,
+  //   return SW_ERR_NARROW_FAILED.
+  // Step 3: (deferred) enumerate snap chain to find the record whose
+  //   snap_id matches this cap's identity, call snap_record_parse,
+  //   check FROZEN via snapshot_wire_check_frozen. TODAY: skipped --
+  //   snap_chain_walk is a stub (KERNEL GAP #B) and cap-slot -> snap_id
+  //   resolution needs a kernel-side cap-query primitive that doesn't
+  //   exist yet. The FROZEN gate is a WIRED but UNREACHABLE code path.
+  // Step 4: issue the snap-mount kernel op. TODAY: unwired
+  //   (KERNEL GAP #A). Every legal caller reaches this point and
+  //   receives SW_ERR_KERNEL_NOT_IMPL.
+  //
+  // Register plan: rbx=snap_cap_slot, r12=mount_point_ptr, r13=flags,
+  // pushed/popped around every nested call.
+  // ==========================================================================
+  pub let snapshot_wire_mount : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
+    fn (snap_cap_slot: u64) (mount_point_ptr: u64) (flags: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, cap},
+      justification: "mount.pdxfs.M6-003 (#23): snapshot_wire_mount entry point. push rbx/r12/r13. rbx=snap_cap_slot, r12=mount_point_ptr, r13=flags. Step 1 -- RW conflict: mov rax,r13; and rax,0x1 (Argv::PA_FLAG_RO); cmp rax,0; jne no_rw_conflict; pop r13/r12/rbx; mov rax,4 (SW_ERR_CONFLICT_WITH_RW); ret. no_rw_conflict: Step 2 -- narrow. mov rdi,rbx; mov rsi,0x001 (SW_OPS_MASK_READ_ONLY); lea rdx,[rip+mount_sw_narrowed_slot]; call vol_snapshot_narrow. cmp rax,0; jne narrow_bad. Step 4 -- kernel op stub. Every reachable path today returns SW_ERR_KERNEL_NOT_IMPL. pop r13/r12/rbx; mov rax,1; ret. narrow_bad: pop r13/r12/rbx; mov rax,2 (SW_ERR_NARROW_FAILED); ret. No `add reg,[mem]`, no `test`. Labels prefixed mount_sw_mt_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // rbx = snap_cap_slot
+        mov r12, rsi;                        // r12 = mount_point_ptr
+        mov r13, rdx;                        // r13 = flags
+
+        // ---- Step 1: RW conflict check. ---------------------------------
+        mov rax, r13;
+        and rax, 0x1;                        // Argv::PA_FLAG_RO (implicit for --snapshot)
+        cmp rax, 0;
+        jne mount_sw_mt_ro_ok;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 4;                          // SW_ERR_CONFLICT_WITH_RW
+        ret;
+
+      mount_sw_mt_ro_ok:
+        // ---- Step 2: narrow snap cap to R_VSNAP_READ. -------------------
+        mov rdi, rbx;
+        mov rsi, 0x001;                      // SW_OPS_MASK_READ_ONLY
+        lea rdx, [rip + mount_sw_narrowed_slot];
+        call vol_snapshot_narrow;
+
+        cmp rax, 0;
+        jne mount_sw_mt_narrow_bad;
+
+        // ---- Step 3 (deferred): FROZEN gate. See module header.
+        // ---- Step 4: snap-mount kernel op (KERNEL GAP #A). ------------
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 1;                          // SW_ERR_KERNEL_NOT_IMPL
+        ret;
+
+      mount_sw_mt_narrow_bad:
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 2;                          // SW_ERR_NARROW_FAILED
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // snapshot_wire_list(volume_cap_slot, snap_head_lba, out_ptr, out_cap,
+  //                    out_count_ptr) -> u64
+  //     (SW_OK | SW_ERR_KERNEL_NOT_IMPL)
+  //
+  // Thin passthrough to libpdx-volume.snap_chain_walk. Every argument
+  // is forwarded verbatim; the return is mapped to SW_OK on 0 or
+  // SW_ERR_KERNEL_NOT_IMPL on anything else. Today `snap_chain_walk`
+  // is itself a stub returning LPV_SNAP_ERR_NOT_IMPL for every input
+  // (KERNEL GAP #B), so this function likewise refuses every call.
+  //
+  // Once snap_chain_walk gains a real body, callers of this function
+  // will need to iterate `out_ptr[0..*out_count_ptr]` printing one
+  // line per SnapRecord summary via a companion `snapshot_wire_render`
+  // function -- not yet landed since it has nothing to render today.
+  // ==========================================================================
+  pub let snapshot_wire_list : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
+    fn (volume_cap_slot: u64) (snap_head_lba: u64) (out_ptr: u64) (out_cap: u64) (out_count_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, cap},
+      justification: "mount.pdxfs.M6-003 (#23): snapshot_wire_list entry point. Passthrough to snap_chain_walk with the same 5-arg signature. call snap_chain_walk (rdi/rsi/rdx/rcx/r8 already carry the arguments in the right SysV positions). cmp rax,0; je ok; mov rax,1 (SW_ERR_KERNEL_NOT_IMPL); ret. ok: xor rax,rax; ret. No push/pop -- pure passthrough. No `add reg,[mem]`; no `test`. Labels prefixed mount_sw_ls_.",
+      block: {
+        call snap_chain_walk;
+        cmp rax, 0;
+        je mount_sw_ls_ok;
+
+        mov rax, 1;                          // SW_ERR_KERNEL_NOT_IMPL
+        ret;
+
+      mount_sw_ls_ok:
+        xor rax, rax;
+        ret;
+      }
+    }
+}

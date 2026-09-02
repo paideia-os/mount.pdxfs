@@ -79,10 +79,19 @@
 module Argv = structure {
 
   // --- ParsedArgv out-struct offsets (see module header). ---------------
+  // M6 (issues #21/#22/#23/#24) grew the struct by 24 bytes to 48
+  // total: three new value-flag slots after the M1 24-byte prefix.
+  // The M1 offsets stay byte-for-byte unchanged so main.pdx's own M3
+  // loads of PA_OFF_FLAGS/VOLUME_CAP_PTR/MOUNT_POINT_PTR keep working
+  // verbatim -- every M6 addition is APPENDED.
   pub let PA_OFF_FLAGS           : u64 = 0
   pub let PA_OFF_VOLUME_CAP_PTR  : u64 = 8
   pub let PA_OFF_MOUNT_POINT_PTR : u64 = 16
-  pub let PA_STRUCT_BYTES        : u64 = 24
+  // M6 additions:
+  pub let PA_OFF_SNAPSHOT_SLOT   : u64 = 24  // u64; 0 sentinel = unset
+  pub let PA_OFF_PASSPHRASE_FD   : u64 = 32  // i64; -1 sentinel = unset
+  pub let PA_OFF_RESERVED_M6     : u64 = 40  // reserved for M6.x growth
+  pub let PA_STRUCT_BYTES        : u64 = 48
 
   // --- ParsedArgv.flags bit assignments (matches the task brief's own
   //     bit0..bit3 layout exactly). -----------------------------------
@@ -90,6 +99,18 @@ module Argv = structure {
   pub let PA_FLAG_NOEXEC   : u64 = 0x2
   pub let PA_FLAG_VERBOSE  : u64 = 0x4
   pub let PA_FLAG_DRY_RUN  : u64 = 0x8
+
+  // --- M6 flag bits (present-only, values in dedicated slots above).
+  //     PA_FLAG_ALL is a boolean; PA_FLAG_SNAPSHOT_LIST is boolean too;
+  //     PA_FLAG_SNAPSHOT_SET / PA_FLAG_PASSPHRASE_FD_SET are presence
+  //     bits for the two value flags whose actual data lives in the
+  //     dedicated PA_OFF_SNAPSHOT_SLOT / PA_OFF_PASSPHRASE_FD slots
+  //     (matching mkfs.pdxfs's own PA_FLAG_*_SET pattern for its
+  //     value-flag presence detection). --------------------------------
+  pub let PA_FLAG_ALL              : u64 = 0x10
+  pub let PA_FLAG_SNAPSHOT_LIST    : u64 = 0x20
+  pub let PA_FLAG_SNAPSHOT_SET     : u64 = 0x40
+  pub let PA_FLAG_PASSPHRASE_FD_SET : u64 = 0x80
 
   // --- argv_parse status codes. ------------------------------------------
   pub let ARGV_OK                       : u64 = 0
@@ -101,6 +122,17 @@ module Argv = structure {
   pub let argv_lit_noexec   : [u8; 9]  = "--noexec\0"
   pub let argv_lit_verbose  : [u8; 10] = "--verbose\0"
   pub let argv_lit_dry_run  : [u8; 10] = "--dry-run\0"
+
+  // --- M6 flag literals. Boolean flags via argv_streq exact match;
+  //     value flags via argv_prefix_match against the '=' suffix,
+  //     matching mkfs.pdxfs's own value-flag convention. -----------------
+  pub let argv_lit_all           : [u8; 6]  = "--all\0"
+  pub let argv_lit_snap_list     : [u8; 16] = "--snapshot-list\0"
+
+  pub let argv_lit_snapshot_eq       : [u8; 12] = "--snapshot=\0"
+  pub let ARGV_LIT_SNAPSHOT_EQ_LEN   : u64 = 11
+  pub let argv_lit_passphrase_fd_eq       : [u8; 17] = "--passphrase-fd=\0"
+  pub let ARGV_LIT_PASSPHRASE_FD_EQ_LEN   : u64 = 16
 
   // ==========================================================================
   // argv_streq(a_ptr, b_ptr) -> u64 (1 = equal, 0 = not equal)
@@ -139,6 +171,93 @@ module Argv = structure {
     }
 
   // ==========================================================================
+  // argv_prefix_match(a_ptr, lit_ptr, lit_len) -> u64
+  //     (1 = a_ptr's first lit_len bytes equal lit_ptr's; 0 = not)
+  //
+  // Byte-loop prefix compare, identical shape to mkfs.pdxfs's own
+  // Argv::argv_prefix_match. Used for the two value-flag literals
+  // ('--snapshot=' / '--passphrase-fd='); on a 1 return, the caller
+  // computes the value pointer as `a_ptr + lit_len` itself. Pure
+  // leaf.
+  // ==========================================================================
+  pub let argv_prefix_match : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (a_ptr: u64) (lit_ptr: u64) (lit_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M6-003/M6-004 (#23/#24A): argv_prefix_match entry point. Pure leaf. rdi=a_ptr, rsi=lit_ptr, rdx=lit_len. rcx=index. Loop: cmp rcx,rdx; jge yes. xor+mov_b load a[rcx] into rax and lit[rcx] into r8; cmp rax,r8; jne no; add rcx,1; jmp loop. yes: mov rax,1; ret. no: xor rax,rax; ret. No `add reg,[mem]`; no `test`. Labels prefixed mount_argv_pm_.",
+      block: {
+        xor rcx, rcx;
+
+      mount_argv_pm_loop:
+        cmp rcx, rdx;
+        jge mount_argv_pm_yes;
+
+        xor rax, rax;
+        mov_b rax, [rdi + rcx*1];
+        xor r8, r8;
+        mov_b r8, [rsi + rcx*1];
+        cmp rax, r8;
+        jne mount_argv_pm_no;
+
+        add rcx, 1;
+        jmp mount_argv_pm_loop;
+
+      mount_argv_pm_yes:
+        mov rax, 1;
+        ret;
+
+      mount_argv_pm_no:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // argv_parse_u64_dec(str_ptr) -> u64
+  //
+  // Decimal-string -> u64 parser, stopping at first non-digit. Same
+  // shape as mkfs.pdxfs's own Argv::argv_parse_u64_dec: multiplies
+  // via (acc<<3) + acc + acc (avoiding imul per this codebase's
+  // no-multiply-by-constant convention). Pure leaf, malformed input
+  // yields whatever partial value has accumulated (typically 0),
+  // matching the ambient parser convention.
+  //
+  // Used to parse --passphrase-fd=<n>'s value (a small positive
+  // integer, typically 3 or 4 for a caller that dup2'd a pipe read
+  // end onto a low fd) and --snapshot=<n>'s value (a KIND_VOLUME_
+  // SNAPSHOT cap slot number, small positive integer).
+  // ==========================================================================
+  pub let argv_parse_u64_dec : (u64) -> u64 !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M6-003/M6-004 (#23/#24A): argv_parse_u64_dec entry point. Pure leaf. rdi=str_ptr. rax=accumulator (0). Loop: xor+mov_b load *rdi into rcx; cmp rcx,0x30; jl done; cmp rcx,0x39; jg done. mov r8,rax; shl r8,3; add r8,rax; add r8,rax (r8=rax*10 via shift-and-add, no imul per codebase discipline). sub rcx,0x30; add r8,rcx; mov rax,r8; add rdi,1; jmp loop. done: ret. No `add reg,[mem]`; no `test`. Labels prefixed mount_argv_pu_.",
+      block: {
+        xor rax, rax;
+
+      mount_argv_pu_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0x30;
+        jl mount_argv_pu_done;
+        cmp rcx, 0x39;
+        jg mount_argv_pu_done;
+
+        mov r8, rax;
+        shl r8, 3;
+        add r8, rax;
+        add r8, rax;
+        sub rcx, 0x30;
+        add r8, rcx;
+        mov rax, r8;
+
+        add rdi, 1;
+        jmp mount_argv_pu_loop;
+
+      mount_argv_pu_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
   // argv_parse(argc, argv, out_ptr) -> u64
   //     (ARGV_OK | ARGV_ERR_MISSING_VOLUME_CAP | ARGV_ERR_MISSING_MOUNT_POINT)
   //
@@ -147,8 +266,10 @@ module Argv = structure {
   //                 forwarded here unchanged by main.pdx)
   //   rsi = argv   (VA of a char*[]; argv[0] is the program name and is
   //                 skipped -- this loop starts at index 1)
-  //   rdx = out_ptr (ParsedArgv struct; PA_STRUCT_BYTES = 24 bytes,
-  //                 caller-allocated .bss per main.pdx)
+  //   rdx = out_ptr (ParsedArgv struct; PA_STRUCT_BYTES = 48 bytes at
+  //                 M6 -- was 24 at M1..M3, widened by the three new
+  //                 value-flag slots appended past +24; caller-allocated
+  //                 .bss per main.pdx)
   //
   // Register plan across the loop (all SysV callee-save; pushed on entry
   // and popped at the shared epilogue, so they survive the nested
@@ -185,6 +306,12 @@ module Argv = structure {
         mov [r13 + 0], rax;                 // flags = 0
         mov [r13 + 8], rax;                 // volume_cap_ptr = 0
         mov [r13 + 16], rax;                // mount_point_ptr = 0
+        // M6 additions.
+        mov [r13 + 24], rax;                // snapshot_slot = 0 (unset sentinel)
+        // passphrase_fd = -1 (unset sentinel; -1 = 0xFFFF...FF as u64)
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        mov [r13 + 32], r10;                // passphrase_fd = -1
+        mov [r13 + 40], rax;                // reserved
 
         mov r14, 1;                         // i = 1 (skip argv[0])
 
@@ -235,10 +362,77 @@ module Argv = structure {
         lea rsi, [rip + argv_lit_dry_run];
         call argv_streq;
         cmp rax, 0;
-        je mount_argv_positional;
+        je mount_argv_check_all;
 
         mov rax, [r13 + 0];
         or rax, 0x8;                        // PA_FLAG_DRY_RUN
+        mov [r13 + 0], rax;
+        jmp mount_argv_scan_next;
+
+      // ---- M6 (#24C): --all (exact) --------------------------------------
+      mount_argv_check_all:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_all];
+        call argv_streq;
+        cmp rax, 0;
+        je mount_argv_check_snap_list;
+
+        mov rax, [r13 + 0];
+        or rax, 0x10;                       // PA_FLAG_ALL
+        mov [r13 + 0], rax;
+        jmp mount_argv_scan_next;
+
+      // ---- M6 (#23): --snapshot-list (exact) -----------------------------
+      mount_argv_check_snap_list:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_snap_list];
+        call argv_streq;
+        cmp rax, 0;
+        je mount_argv_check_snap_eq;
+
+        mov rax, [r13 + 0];
+        or rax, 0x20;                       // PA_FLAG_SNAPSHOT_LIST
+        mov [r13 + 0], rax;
+        jmp mount_argv_scan_next;
+
+      // ---- M6 (#23): --snapshot=<slot> (prefix + decimal) ----------------
+      mount_argv_check_snap_eq:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_snapshot_eq];
+        mov rdx, 11;                        // ARGV_LIT_SNAPSHOT_EQ_LEN
+        call argv_prefix_match;
+        cmp rax, 0;
+        je mount_argv_check_pass_fd;
+
+        // Parse the value tail (r15 + 11).
+        mov rdi, r15;
+        add rdi, 11;
+        call argv_parse_u64_dec;
+        mov [r13 + 24], rax;                // snapshot_slot = parsed value
+
+        // Set presence bit + implicit PA_FLAG_RO (a snap mount is
+        // read-only per snapshot_wire.pdx).
+        mov rax, [r13 + 0];
+        or rax, 0x41;                       // PA_FLAG_SNAPSHOT_SET | PA_FLAG_RO
+        mov [r13 + 0], rax;
+        jmp mount_argv_scan_next;
+
+      // ---- M6 (#24A): --passphrase-fd=<n> (prefix + decimal) -------------
+      mount_argv_check_pass_fd:
+        mov rdi, r15;
+        lea rsi, [rip + argv_lit_passphrase_fd_eq];
+        mov rdx, 16;                        // ARGV_LIT_PASSPHRASE_FD_EQ_LEN
+        call argv_prefix_match;
+        cmp rax, 0;
+        je mount_argv_positional;
+
+        mov rdi, r15;
+        add rdi, 16;
+        call argv_parse_u64_dec;
+        mov [r13 + 32], rax;                // passphrase_fd = parsed value
+
+        mov rax, [r13 + 0];
+        or rax, 0x80;                       // PA_FLAG_PASSPHRASE_FD_SET
         mov [r13 + 0], rax;
         jmp mount_argv_scan_next;
 
@@ -264,14 +458,39 @@ module Argv = structure {
         jmp mount_argv_scan_loop;
 
       mount_argv_scan_done:
+        // ---- M6 gating: --all, --snapshot-list, --snapshot= relax the
+        // ----   two-positional requirement per their surface:
+        //         --all:            neither positional required
+        //         --snapshot-list:  volume-cap only (mount_point ignored)
+        //         --snapshot=:      mount_point only (volume-cap ignored)
+        //       Presence bits gate which refusals fire below. ---------
+        mov rax, [r13 + 0];                 // reload flags
+        and rax, 0x10;                      // PA_FLAG_ALL
+        cmp rax, 0;
+        jne mount_argv_ok_short;            // --all: skip positional checks
+
+        // --snapshot=: skip volume-cap check, still require mount-point.
+        mov rax, [r13 + 0];
+        and rax, 0x40;                      // PA_FLAG_SNAPSHOT_SET
+        cmp rax, 0;
+        jne mount_argv_skip_volume_check;
+
         mov rax, [r13 + 8];                 // reload volume_cap_ptr
         cmp rax, 0;
         je mount_argv_missing_volume_cap;
+
+      mount_argv_skip_volume_check:
+        // --snapshot-list: skip mount-point check.
+        mov rax, [r13 + 0];
+        and rax, 0x20;                      // PA_FLAG_SNAPSHOT_LIST
+        cmp rax, 0;
+        jne mount_argv_ok_short;
 
         mov rax, [r13 + 16];                // reload mount_point_ptr
         cmp rax, 0;
         je mount_argv_missing_mount_point;
 
+      mount_argv_ok_short:
         xor rax, rax;                       // ARGV_OK
         jmp mount_argv_epilogue;
 

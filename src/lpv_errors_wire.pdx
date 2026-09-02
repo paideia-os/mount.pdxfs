@@ -1,0 +1,126 @@
+// src/lpv_errors_wire.pdx — mount.pdxfs.M6-001 (#21) — adopt
+// libpdx-volume v1.1's banded LPV_E_* namespace + lpv_strerror scaffold.
+//
+// ----------------------------------------------------------------------
+// What this module owns
+// ----------------------------------------------------------------------
+//
+// The v1.1 landing of libpdx-volume (#19 in that repo) introduced a
+// banded LPV_E_* error-code namespace (0x0100..0x0AFF, one 256-code
+// band per subsystem) plus a table-driven `lpv_strerror` scaffold that
+// renders a code into a short ASCII string in a caller-supplied
+// buffer. Downstream consumers are asked to (a) reference the LPV_E_*
+// constants directly rather than magic small integers, and (b) call
+// `lpv_strerror` in place of a per-tool stringify table.
+//
+// mount.pdxfs already carries its OWN result-code vocabulary
+// (MR_RESULT_* in src/mount_record.pdx) that names user-facing
+// outcomes distinct from libpdx-volume's per-band codes -- MR_RESULT_
+// EDQUOT is a mount-tool concept, not a libpdx-volume return code.
+// The two vocabularies coexist:
+//
+//   - LPV_E_* codes surface at library-call boundaries (a
+//     vol_kind_mint_elevate, pdxb_quota_check, or snap_chain_walk
+//     return value).
+//   - MR_RESULT_* codes surface at the tool's semantic-pipe emit
+//     boundary and its exit-status contract.
+//
+// This module is the single mount-side call site for `lpv_strerror`.
+// It wraps the library call in a bounded 48-byte stack buffer (fits
+// LPV_STRERROR_MSG_MAX_LEN = 32 comfortably) and writes the resulting
+// text to fd 2 (stderr) as a diagnostic line, followed by a NEWLINE.
+// Called on every LPV_E_* result the mount-time pipeline observes,
+// before the MR_RESULT_* mapping fires, so an operator sees the
+// library-side reason as well as the tool-side classification.
+//
+// ----------------------------------------------------------------------
+// v1.1.0 posture: lpv_strerror scaffold returns 0 for every input
+// ----------------------------------------------------------------------
+//
+// libpdx-volume v1.1.0's `lpv_strerror` body writes a single NUL byte
+// and returns 0 (unknown code) for EVERY input at this landing -- the
+// LPV_E_* constants + message-string bindings are the load-bearing
+// part of the v1.1 change; the dispatch chain is a v1.1.x follow-up.
+// This module therefore treats a 0 return as "message unavailable" and
+// skips the diagnostic write in that case, matching the library's own
+// "the caller sees an empty string rather than random bytes" contract.
+// Once the dispatch is populated upstream, this wrapper's behavior
+// changes automatically -- no mount-side edit needed.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg,[mem]`. No `test`; every zero-check is `cmp reg, 0`.
+// Reserved-label discipline: every branch label prefixed `mount_lpv_`.
+//
+// Upstream: paideia-satellites/libpdx-volume v1.1.0 (issues #19, #33);
+// design/tooling/volume-tooling-ux.md §9.4 addendum.
+
+module LpvErrorsWire = structure {
+
+  // Bounded scratch for the stringified message. LPV_STRERROR_MSG_MAX_LEN
+  // = 32 upstream; 48 gives room for a trailing "\n\0" and future growth
+  // without forcing another module rev.
+  pub let mut mount_lpv_msg_scratch : [u8; 48] = uninit @align(8)
+
+  // ==========================================================================
+  // mount_lpv_diag_write(lpv_code) -> ()
+  //
+  //   rdi = lpv_code   (an LPV_E_* value from any libpdx-volume call
+  //                      site -- 0x0101, 0x0803, 0x0A04, etc.)
+  //
+  // Calls `lpv_strerror(code, &scratch, 48)`, then if the returned
+  // length is > 0 issues sys_write(2, scratch, len) followed by a
+  // one-byte '\n'. If the returned length is 0 (v1.1.0 scaffold's own
+  // "unknown code" posture -- every input at this landing) the
+  // diagnostic is silently skipped, per module header. mount.pdxfs's
+  // OWN MR_RESULT_* mapping fires unconditionally regardless of what
+  // this wrapper does, so a suppressed diagnostic is a lost hint at
+  // debugging-time, not a correctness bug.
+  //
+  // Pure leaf at the register-plan level (rax/rdi/rsi/rdx/rcx/r8 all
+  // SysV caller-save, no push/pop needed for this scaffold shape).
+  // Cross-module `call lpv_strerror` uses the bare-symbol convention
+  // src/volume_cap.pdx's `call vol_kind_narrow` established.
+  // ==========================================================================
+  pub let mount_lpv_diag_write : (u64) -> () !{mem, sysreg} @{fs} =
+    fn (lpv_code: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "mount.pdxfs.M6-001 (#21): mount_lpv_diag_write entry point. push r12 (need one callee-save slot to hold the returned length across the sys_write instructions -- SYSCALL preserves callee-save registers even under the kernel's #743 caller-save-zeroing hardening). Call lpv_strerror: rdi already holds lpv_code from the caller; lea rsi,[rip+mount_lpv_msg_scratch]; mov rdx,48; call lpv_strerror -> rax = bytes written excluding NUL. mov r12,rax; cmp r12,0; je mount_lpv_skip (scaffold's unknown-code case, module header). Real message: sys_write(2, &scratch, r12) -- mov rdi,2 (stderr), lea rsi,[rip+mount_lpv_msg_scratch], mov rdx,r12, mov rax,1 (sys_write), syscall. Then a bare newline via a stack-local byte: sub rsp,8; mov al,0x0A; mov [rsp],al; mov rdi,2; mov rsi,rsp; mov rdx,1; mov rax,1; syscall; add rsp,8. Pop r12; ret. No `add reg,[mem]`, no `test`; every check is `cmp reg,0`. Labels prefixed mount_lpv_.",
+      block: {
+        push r12;
+
+        // Call libpdx-volume's lpv_strerror.
+        lea rsi, [rip + mount_lpv_msg_scratch];
+        mov rdx, 48;
+        call lpv_strerror;
+        mov r12, rax;
+
+        cmp r12, 0;
+        je mount_lpv_skip;
+
+        // sys_write(2, &scratch, r12)
+        mov rdi, 2;
+        lea rsi, [rip + mount_lpv_msg_scratch];
+        mov rdx, r12;
+        mov rax, 1;
+        syscall;
+
+        // sys_write(2, "\n", 1)
+        sub rsp, 8;
+        mov al, 0x0A;
+        mov [rsp], al;
+        mov rdi, 2;
+        mov rsi, rsp;
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        add rsp, 8;
+
+      mount_lpv_skip:
+        pop r12;
+        ret;
+      }
+    }
+}

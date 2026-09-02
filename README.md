@@ -27,12 +27,16 @@ upstream CLI spec this tool implements.
 
 ## Status
 
-**v1.0.0 — M1..M5 landed** (source-form release scaffold; the actual
-dual-sign + mirror-push run is deferred, see
-[`release/RELEASE-1.0.0.md`](release/RELEASE-1.0.0.md)). See
-[`STATUS.md`](STATUS.md) for the per-issue checklist and
+**v1.1.1 — M1..M6 landed + #22 elevate-cap wire-through fix** (M6 adopts the full `libpdx-volume` v1.1.0
+API surface — LV.M1..M6 landings, `paideia-os/libpdx-volume`
+#18..#31 — plus three new argv surfaces and six new `MR_RESULT_*`
+codes; see `CHANGELOG.md`'s 1.1.0 entry for the per-issue
+write-up). The M5 dual-sign + mirror-push run remains a documented
+deferral (see [`release/RELEASE-1.0.0.md`](release/RELEASE-1.0.0.md)).
+See [`STATUS.md`](STATUS.md) for the per-issue checklist and
 `design/tooling/volume-tooling-ux.md` §9.2 in paideia-os for the full
-M1..M5 milestone breakdown (16 issues).
+M1..M5 milestone breakdown; M6 is a post-R53 adoption wave landed
+alongside `libpdx-volume` v1.1.0.
 
 Try it (once built and linked into a runnable image):
 
@@ -50,14 +54,19 @@ PdxFsMountRecord@0.1 { volume: cap:volume:0x0002, mount_point: /mnt/data, flags:
 
 and exits 0 without mounting anything (`flags: 9` = `PA_FLAG_RO (0x1)
 | PA_FLAG_DRY_RUN (0x8)`). An invocation without `--dry-run` against a
-`/system/**`, `/boot/**`, or `/dev/**` mount point prints `result_code:
-ELEVATION_STUB` and exits 4 (no `libpdx-elevate` broker cap provisioned
-yet — see "Depends on" below); against any other mount point it runs
-the real `sys_mount` pipeline and, since the kernel's `dispatch_mount`
-is still an unconditional `-ENOSYS` stub, prints `result_code: ENOSYS`
-and exits 3 — every terminal outcome is now audit-wrapped (`libpdx-
-audit`, one shared `audit_id` per invocation) and mapped to one of the
-fifteen `MR_RESULT_*` codes `src/mount_record.pdx` defines.
+`/system/**`, `/boot/**`, or `/dev/**` mount point (at v1.1.1) prints
+`result_code: NO_ELEVATE` and exits 3 via `mint_wire_invoke`'s
+refuse-gate (no `KIND_ELEVATE_CHANNEL` cap provisioned yet — see
+"Depends on" below; prior to v1.1.1 this arm printed `ELEVATION_STUB`
+and exited 4 through the M3-era stub, since replaced); against any
+other mount point it runs the real `sys_mount` pipeline and, since
+the kernel's `dispatch_mount` is still an unconditional `-ENOSYS`
+stub, prints `result_code: ENOSYS` and exits 3 — every terminal
+outcome is now audit-wrapped (`libpdx-audit`, one shared `audit_id`
+per invocation) and mapped to one of the `MR_RESULT_*` codes
+`src/mount_record.pdx` defines (the M3-004 kernel-errno taxonomy
+plus the six M6 codes 16..21 plus `MINT_FAILED = 22` added at
+1.1.1).
 
 ## Depends on
 
@@ -93,6 +102,7 @@ fifteen `MR_RESULT_*` codes `src/mount_record.pdx` defines.
 | M3 | Elevate + audit-first INTENT/RESULT + semantic-pipe + failure taxonomy | **Landed** |
 | M4 | Tests + smoke | **Landed** |
 | M5 | Signed release | **Landed** (source-form scaffold) |
+| M6 | libpdx-volume v1.1 API adoption (`--all` / `--snapshot=` / `--snapshot-list` / `--passphrase-fd=`; six new `MR_RESULT_*` codes) | **Landed** |
 
 ## License
 

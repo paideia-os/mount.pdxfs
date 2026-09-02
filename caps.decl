@@ -165,3 +165,32 @@
 # this tool's future milestones consume, per the same "typed-against,
 # not yet touched" posture mkfs.pdxfs's own M1 caps.decl documents for
 # its stub functions.
+#
+# M6 landing status (see STATUS.md, CHANGELOG.md 1.1.0): the six new
+# wire modules (dep_graph_wire, lpv_errors_wire, mint_wire,
+# passphrase_wire, quota_wire, snapshot_wire) call into libpdx-volume
+# v1.1.0 for the M6 dispatches (`--all`, `--snapshot=`, `--snapshot-
+# list`, `--passphrase-fd=`). No new KIND is CONSUMED by this repo
+# at M6 -- three prospective kernel-side kinds surface as documented
+# GAPS in the wire modules but are not yet declared here:
+#
+#   - KIND_VOLUME_SNAPSHOT (0x1A1, libpdx-volume-side ordinal): no
+#     matching kernel-side cap kind at this landing. The snap-mount
+#     syscall analog to sys_mount likewise does not exist. Every
+#     `--snapshot=` call refuses SNAPSHOT_NOT_IMPL until both land
+#     (KERNEL GAP #A in src/snapshot_wire.pdx).
+#
+#   - KIND_DEK (aspirational): no kernel-side cap kind for a 32-byte
+#     unwrapped DEK. src/passphrase_wire.pdx unwraps into private .bss
+#     scratch; the "install as cap" hop is a future landing (GAP #P2
+#     in that file's own header).
+#
+#   - KIND_PDXFS_QUOTA (aspirational): no kernel-side cap kind for
+#     the per-mount quota-table cache. src/quota_wire.pdx's install
+#     helper is a documented no-op stub (GAP #Q1 in that file's own
+#     header); the M4 wave landed the on-disk wire format + codec but
+#     not the FS-layer seeding path.
+#
+# All three will be declared here in `consumed_kinds` once the
+# kernel-side ordinals land; nothing this repo emits or invokes today
+# depends on any of them.

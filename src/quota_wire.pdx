@@ -1,0 +1,205 @@
+// src/quota_wire.pdx — mount.pdxfs.M6-005 (#24 part B) — mount-time
+// quota-table cache install + write-path enforcement wrapper.
+//
+// ----------------------------------------------------------------------
+// Two responsibilities, one module
+// ----------------------------------------------------------------------
+//
+// The M4 wave (libpdx-volume#28) landed real block-quota check /
+// commit helpers over a decoded per-subject summary. mount.pdxfs's
+// role is TWO-FOLD:
+//
+//   (1) At mount time, if the volume's superblock has PDXB_FLAG_HAS_QUOTA
+//       set (bit 0 of pdxb_sb_get_flags), read the quota-table anchor
+//       (quota_table_lba + quota_table_bcount from the superblock's
+//       _reserved region at +160/+168) and install a KIND_PDXFS_QUOTA
+//       cap kernel-side so the FS layer can consult it on every write.
+//       See GAP #Q1 below.
+//
+//   (2) At (future) write time, the FS layer (or mount.pdxfs itself
+//       when it grows a write path) calls this module's
+//       `quota_wire_check_or_refuse` wrapper, which composes
+//       pdxb_quota_table_lookup + pdxb_quota_check with mount.pdxfs's
+//       own EDQUOT-style refusal contract:
+//         - LPV_QUOTA_HARD_EXCEEDED (0x0803)  -> QW_ERR_EDQUOT (refuse)
+//         - LPV_QUOTA_SOFT_EXCEEDED (0x0801)  -> QW_WARN (proceed)
+//         - LPV_QUOTA_SOFT_GRACE_EXPIRED (0x0802) -> QW_ERR_EDQUOT
+//         - LPV_QUOTA_OK (0)                  -> QW_OK
+//         - LPV_QUOTA_ERR_BAD_ROW (0x0804)    -> QW_ERR_BAD_ROW
+//         - LPV_QUOTA_ERR_NOT_FOUND (0x0805)  -> QW_OK (no quota row =
+//                                                unlimited)
+//
+// ----------------------------------------------------------------------
+// Gaps this module documents
+// ----------------------------------------------------------------------
+//
+//   GAP #Q1: no KIND_PDXFS_QUOTA cap kernel-side. The M4 landing
+//     defines the on-disk wire format + client-side codec but the
+//     kernel-side cap kind + syscall to seed the FS layer's per-mount
+//     quota table cache does not exist yet. `quota_wire_install`
+//     below is a documented no-op returning QW_OK -- mount.pdxfs's
+//     M6 landing therefore silently ignores PDXB_FLAG_HAS_QUOTA for
+//     the install step, leaving quota enforcement moot until this
+//     gap closes.
+//
+//   GAP #Q2: mount.pdxfs has no write path of its own at M6. The
+//     enforcement wrapper below is a REAL body wired to real
+//     libpdx-volume calls, but its only call sites today are unit
+//     tests -- no production write path calls it. A future landing
+//     that gives mount.pdxfs (or a companion FS-write daemon) a real
+//     write op will wire this wrapper in.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg,[mem]`. No `test`; every zero-check is `cmp reg, 0`.
+// Reserved-label discipline: every branch label prefixed `mount_qw_`.
+//
+// Upstream: paideia-satellites/libpdx-volume v1.1.0 (issues #27, #28);
+// design/tooling/volume-tooling-ux.md §4.8 (quota enforcement surface).
+
+module QuotaWire = structure {
+
+  // --- Return codes. -----------------------------------------------------
+  pub let QW_OK              : u64 = 0
+  pub let QW_WARN            : u64 = 1   // soft exceeded, proceed
+  pub let QW_ERR_EDQUOT      : u64 = 2   // hard or grace-expired
+  pub let QW_ERR_BAD_ROW     : u64 = 3
+  pub let QW_ERR_NOT_IMPL    : u64 = 4   // install path -- see GAP #Q1
+
+  // --- Superblock quota-anchor offsets (per libpdx-volume#27). ---------
+  pub let QW_D_OFF_QUOTA_TABLE_LBA    : u64 = 160
+  pub let QW_D_OFF_QUOTA_TABLE_BCOUNT : u64 = 168
+  pub let QW_D_OFF_QUOTA_FLAGS        : u64 = 176
+
+  // --- PDXB_FLAG_HAS_QUOTA bit (superblock flags, bit 0). --------------
+  pub let QW_SB_FLAG_HAS_QUOTA        : u64 = 0x1
+
+  // --- Quota-flags bits (from libpdx-volume/src/pdxb_quota.pdx). -------
+  pub let QW_QUOTA_ENFORCE_HARD       : u64 = 0x1
+  pub let QW_QUOTA_ENFORCE_SOFT       : u64 = 0x2
+
+  // ==========================================================================
+  // quota_wire_sb_has_quota(sb_ptr) -> u64 (1 = has quota, 0 = not)
+  //
+  //   rdi = sb_ptr  (decoded superblock summary; consumers must have
+  //                   already parsed via pdxb_parse_superblock)
+  //
+  // Reads pdxb_sb_get_flags(sb_ptr) and masks bit 0. Adopting the
+  // v1.1 accessor API rather than reading the flags offset directly,
+  // per libpdx-volume#18. Pure passthrough at the wire level.
+  // ==========================================================================
+  pub let quota_wire_sb_has_quota : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M6-005 (#24B, #21): quota_wire_sb_has_quota entry point. call pdxb_sb_get_flags with rdi unchanged; rax = flags word. and rax,1 (QW_SB_FLAG_HAS_QUOTA, small imm); ret. Pure call-through, no push/pop. No `add reg,[mem]`; no `test`. Labels: none.",
+      block: {
+        call pdxb_sb_get_flags;
+        and rax, 0x1;                        // QW_SB_FLAG_HAS_QUOTA
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // quota_wire_install(sb_ptr, volume_cap_slot) -> u64
+  //     (QW_OK | QW_ERR_NOT_IMPL)
+  //
+  // Reads the quota-table anchor from the superblock and would issue a
+  // KIND_PDXFS_QUOTA seeding syscall to the kernel FS layer, so
+  // subsequent writes on this mount are gated by pdxb_quota_check
+  // against a kernel-cached copy of the table. GAP #Q1: kernel-side
+  // KIND_PDXFS_QUOTA does not exist yet. This function is a
+  // documented STUB returning QW_ERR_NOT_IMPL for any sb_ptr whose
+  // has-quota bit is set, and QW_OK (nothing to install) for any
+  // sb_ptr whose has-quota bit is not.
+  //
+  // Callers do NOT treat QW_ERR_NOT_IMPL as a mount refusal today --
+  // it is a warning that mount succeeded but quota enforcement is
+  // off. Once GAP #Q1 closes, the return semantics tighten: an
+  // encrypted+quota'd volume that cannot install its quota table
+  // becomes a hard mount refusal.
+  // ==========================================================================
+  pub let quota_wire_install : (u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
+    fn (sb_ptr: u64) (volume_cap_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, cap},
+      justification: "mount.pdxfs.M6-005 (#24B): quota_wire_install entry point. Check has-quota: call quota_wire_sb_has_quota (rdi already sb_ptr, rsi ignored by callee); cmp rax,0; je no_quota (return QW_OK). Otherwise KERNEL GAP #Q1: no KIND_PDXFS_QUOTA cap kind; mov rax,4 (QW_ERR_NOT_IMPL); ret. no_quota: xor rax,rax (QW_OK); ret. Pure call+dispatch, no push/pop needed. Labels prefixed mount_qw_in_.",
+      block: {
+        call quota_wire_sb_has_quota;
+        cmp rax, 0;
+        je mount_qw_in_no_quota;
+
+        mov rax, 4;                          // QW_ERR_NOT_IMPL (GAP #Q1)
+        ret;
+
+      mount_qw_in_no_quota:
+        xor rax, rax;                        // QW_OK
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // quota_wire_check_or_refuse(quota_summary_ptr, block_delta,
+  //                            grace_expired) -> u64
+  //     (QW_OK | QW_WARN | QW_ERR_EDQUOT | QW_ERR_BAD_ROW)
+  //
+  //   rdi = quota_summary_ptr  (88-byte decoded summary from
+  //                              pdxb_quota_row_parse -- NOT the raw
+  //                              on-disk 64-byte row, per the v1.1.1
+  //                              INPUT-CONTRACT block in that repo's
+  //                              src/pdxb_quota.pdx above pdxb_quota_check)
+  //   rsi = block_delta         (i64 signed; positive = allocating,
+  //                              negative = freeing)
+  //   rdx = grace_expired       (0 = no, nonzero = grace period expired)
+  //
+  // Thin wrapper around pdxb_quota_check with mount-tool-friendly
+  // return-value mapping. inode_delta is not exposed (v1.1.0 landing's
+  // inode enforcement is a follow-up, so plumbing it through this
+  // wrapper would be dead weight); a follow-up landing widens the
+  // signature.
+  // ==========================================================================
+  pub let quota_wire_check_or_refuse : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (quota_summary_ptr: u64) (block_delta: u64) (grace_expired: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M6-005 (#24B): quota_wire_check_or_refuse entry point. Marshal for pdxb_quota_check(quota_summary_ptr, block_delta, inode_delta=0, grace_expired). rdx (grace_expired from caller) needs to move to rcx; rdx needs to become 0 (inode_delta) for the ABI. Shuffle: mov rcx,rdx (grace); xor rdx,rdx (inode_delta=0). call pdxb_quota_check. Map return: cmp rax,0 (LPV_QUOTA_OK); je ok. mov r10,0x0801 (SOFT_EXCEEDED); cmp rax,r10; je warn. mov r10,0x0802 (SOFT_GRACE_EXPIRED); cmp rax,r10; je edquot. mov r10,0x0803 (HARD_EXCEEDED); cmp rax,r10; je edquot. mov r10,0x0805 (ERR_NOT_FOUND); cmp rax,r10; je ok (no row = unlimited). Default: return QW_ERR_BAD_ROW (3). ok: xor rax,rax; ret. warn: mov rax,1; ret. edquot: mov rax,2; ret. No push/pop. No `add reg,[mem]`; no `test`. Labels prefixed mount_qw_ck_.",
+      block: {
+        mov rcx, rdx;                        // rcx = grace_expired
+        xor rdx, rdx;                        // rdx = inode_delta (unused)
+        call pdxb_quota_check;
+
+        cmp rax, 0;
+        je mount_qw_ck_ok;
+
+        mov r10, 0x0801;                     // SOFT_EXCEEDED
+        cmp rax, r10;
+        je mount_qw_ck_warn;
+
+        mov r10, 0x0802;                     // SOFT_GRACE_EXPIRED
+        cmp rax, r10;
+        je mount_qw_ck_edquot;
+
+        mov r10, 0x0803;                     // HARD_EXCEEDED (+overflow)
+        cmp rax, r10;
+        je mount_qw_ck_edquot;
+
+        mov r10, 0x0805;                     // ERR_NOT_FOUND
+        cmp rax, r10;
+        je mount_qw_ck_ok;
+
+        mov rax, 3;                          // QW_ERR_BAD_ROW (default)
+        ret;
+
+      mount_qw_ck_ok:
+        xor rax, rax;                        // QW_OK
+        ret;
+
+      mount_qw_ck_warn:
+        mov rax, 1;                          // QW_WARN
+        ret;
+
+      mount_qw_ck_edquot:
+        mov rax, 2;                          // QW_ERR_EDQUOT
+        ret;
+      }
+    }
+}

@@ -1,16 +1,16 @@
-# mount.pdxfs v1.0.0 — release manifest (source form)
+# mount.pdxfs v1.1.1 — release manifest (source form)
 #
 # This is the human-readable source form of `manifest.pdxsig`. The
 # release tool at pkgs.paideia-os mirror-push time (a) enumerates the
 # artifact list below, (b) recomputes every BLAKE3-256 hash from the
-# repo tree at the v1.0.0 tag, (c) writes the completed manifest into
+# repo tree at the v1.1.1 tag, (c) writes the completed manifest into
 # a binary `manifest.pdxsig`, and (d) invokes
 #   paideia-pq-sign::sign_release_artifact(sk, manifest_path)
 # once with the paideia-release-line Ed25519 secret key and once with
 # the ML-DSA-65 secret key. The two detached signatures are appended
 # to the manifest in the fixed layout below and the resulting
 # `manifest.pdxsig` is pushed to
-#   https://pkgs.paideia-os/main/mount.pdxfs/1.0.0/manifest.pdxsig
+#   https://pkgs.paideia-os/main/mount.pdxfs/1.1.1/manifest.pdxsig
 # alongside the compiled artifacts.
 #
 # Format mirrors `libpdx-volume`'s `release/manifest.pdxsig.txt` (this
@@ -27,37 +27,47 @@
 #     release-artifact signature rationale (Ed25519 + ML-DSA-65).
 #   design/tooling/plan.md §6.3                               — package
 #     repository layout, `manifest.pdxsig` per version directory.
-#   design/tooling/volume-tooling-ux.md §9.3 (paideia-os)     — M5-001
-#     scope (dual-signed release + .pdxdoc + mirror push) for this repo.
+#   design/tooling/volume-tooling-ux.md §9.2/§9.3 (paideia-os) — the
+#     original M1..M5 scope this repo grew out of; M6 (libpdx-volume
+#     v1.1.0 API adoption) is a post-R53 cascade tracked in CHANGELOG.md.
 
 format-version:      1
 manifest-schema:     paideia-manifest-pdxsig@1
 package-name:        mount.pdxfs
-package-version:     1.0.0
-package-release:     R53-M5
+package-version:     1.1.1
+package-release:     R90-XREPO-M6-fix22
 package-license:     MIT
 source-repo:         https://github.com/paideia-os/mount.pdxfs
-source-commit:       <TAG-v1.0.0-COMMIT-SHA>   # release tool fills in
-source-tag:          v1.0.0
+source-commit:       <TAG-v1.1.1-COMMIT-SHA>   # release tool fills in
+source-tag:          v1.1.1
 
 # ---------------------------------------------------------------
 # Artifact set — every file the compiled package ships. The hash
 # discipline is BLAKE3-256, upper 32 bytes rendered as 64 hex chars.
 # The release tool recomputes each hash from the working tree at the
-# v1.0.0 tag before writing the binary manifest. The order below is
+# v1.1.0 tag before writing the binary manifest. The order below is
 # stable (lexicographic within each section) so the concatenated
 # hash-input is reproducible across signers.
+#
+# NEW at 1.1.0: six wire modules (dep_graph_wire, lpv_errors_wire,
+# mint_wire, passphrase_wire, quota_wire, snapshot_wire).
 # ---------------------------------------------------------------
 
 [artifacts.source]
 caps.decl                          blake3-256 = <BLAKE3-caps.decl>
 src/argv.pdx                       blake3-256 = <BLAKE3-argv.pdx>
 src/audit_wire.pdx                 blake3-256 = <BLAKE3-audit_wire.pdx>
+src/dep_graph_wire.pdx             blake3-256 = <BLAKE3-dep_graph_wire.pdx>
 src/elevate.pdx                    blake3-256 = <BLAKE3-elevate.pdx>
+src/lpv_errors_wire.pdx            blake3-256 = <BLAKE3-lpv_errors_wire.pdx>
 src/main.pdx                       blake3-256 = <BLAKE3-main.pdx>
+src/mint_wire.pdx                  blake3-256 = <BLAKE3-mint_wire.pdx>
 src/mount_op.pdx                   blake3-256 = <BLAKE3-mount_op.pdx>
 src/mount_record.pdx               blake3-256 = <BLAKE3-mount_record.pdx>
+src/passphrase_wire.pdx            blake3-256 = <BLAKE3-passphrase_wire.pdx>
 src/pipe_wire.pdx                  blake3-256 = <BLAKE3-pipe_wire.pdx>
+src/quota_wire.pdx                 blake3-256 = <BLAKE3-quota_wire.pdx>
+src/snapshot_wire.pdx              blake3-256 = <BLAKE3-snapshot_wire.pdx>
 src/volume_cap.pdx                 blake3-256 = <BLAKE3-volume_cap.pdx>
 
 [artifacts.doc]
@@ -82,10 +92,17 @@ CHANGELOG.md                       blake3-256 = <BLAKE3-CHANGELOG.md>
 # Cross-repo dependencies. The consumer's package tool verifies that
 # every `depends-on` row is satisfied by an installed package at a
 # compatible version.
+#
+# NEW at 1.1.0: libpdx-volume bumped to >= 1.1.0 (M6 needs the LV.M2/
+# M3/M4/M5/M6 API surface — vol_kind_mint_elevate, vol_snapshot_narrow,
+# snap_chain_walk, pdxb_quota_check, pdxb_kek_derive, pdxb_dek_unwrap,
+# mount_table_sort_by_deps, mount_deps_parse, plus the six pdxb_sb_
+# get_* accessors and lpv_strerror). Legacy 1.0.0 consumers still
+# compile — v1.1 is additive, no wire-format break.
 # ---------------------------------------------------------------
 
 [depends-on]
-libpdx-volume         >= 1.0.0    # vol_kind_narrow (link edge still open, see design/architecture.md §10.1)
+libpdx-volume         >= 1.1.0    # v1.1 API surface (LV.M1..M6, #18..#31)
 libpdx-audit          >= 0.2.0    # AuditClient::audit_begin/audit_commit
 libpdx-elevate        >= 1.1.0    # declared; not dispatched (fail-closed stub, see §11.1)
 
@@ -101,10 +118,29 @@ kernel-cap-kind         = KIND_VOLUME (0x1A0)
 kernel-cap-kind         = KIND_PDXFS_MOUNT_TABLE (0x1A5)
 kernel-cap-kind         = KIND_ELEVATE_CHANNEL (0x191)             # placeholder, no broker cap bound
 kernel-syscall          = sys_mount (sysno 75)                     # dispatch-unwired as of this release
-                          — every non-dry-run invocation observes
-                          result_code: ENOSYS until dispatch_mount
-                          is wired for real (src/mount_op.pdx §KERNEL
-                          GAP #1).
+                          — every non-dry-run legacy invocation
+                          observes result_code: ENOSYS until
+                          dispatch_mount is wired for real (src/
+                          mount_op.pdx §KERNEL GAP #1).
+
+# M6 substrate gaps this release documents (see CHANGELOG.md 1.1.0's
+# "Known deferred substrate (delta from 1.0.x)" section for the full
+# write-up per gap):
+#   KERNEL GAP #A — no snap-mount syscall (KIND_VOLUME_SNAPSHOT →
+#                   mount table). --snapshot= refuses SNAPSHOT_NOT_IMPL.
+#   KERNEL GAP #B — libpdx-volume.snap_chain_walk is itself a stub.
+#                   --snapshot-list refuses SNAPSHOT_NOT_IMPL.
+#   GAP #P1       — no pdxb_sb_get_dek_nonce accessor in libpdx-volume
+#                   v1.1.0. src/passphrase_wire.pdx uses a direct
+#                   offset arithmetic workaround. Flagged for v1.1.x.
+#   GAP #P2       — no KIND_DEK cap kind kernel-side. Unwrapped DEK
+#                   stays in .bss scratch; "install as cap" hop is a
+#                   future landing.
+#   GAP #Q1       — no KIND_PDXFS_QUOTA cap kind kernel-side. Every
+#                   mount with PDXB_FLAG_HAS_QUOTA set silently
+#                   proceeds without quota enforcement.
+#   GAP #Q2       — no in-tool write path; quota_wire_check_or_refuse
+#                   is a real body with no production call sites yet.
 
 # ---------------------------------------------------------------
 # Signature block — dual-signed per design/02-development-environment.md
@@ -121,7 +157,8 @@ kernel-syscall          = sys_mount (sysno 75)                     # dispatch-un
 # documented placeholder value `SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN`
 # in every slot the real dual-sign pass would fill; see
 # release/RELEASE-1.0.0.md §3 for the full rationale and the flag for
-# main.
+# main (the 1.0.0 release note's dual-sign section applies verbatim to
+# 1.1.0 — no substrate change to the signing pipeline this release).
 # ---------------------------------------------------------------
 
 [signatures]

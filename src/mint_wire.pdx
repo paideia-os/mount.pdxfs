@@ -1,0 +1,220 @@
+// src/mint_wire.pdx — mount.pdxfs.M6-002 (#22) — elevate-cap
+// wire-through for libpdx-volume.vol_kind_mint_elevate.
+//
+// ----------------------------------------------------------------------
+// The three-arg signature this module targets
+// ----------------------------------------------------------------------
+//
+// libpdx-volume v1.1.0's LV.M2-003 (#23) landed a new elevate-aware
+// mint form alongside the legacy 1-arg vol_kind_mint stub (kept for
+// v1.0.0 API compatibility, see that repo's src/vol_kind.pdx):
+//
+//   vol_kind_mint_elevate(dev_cap, elevate_channel_slot,
+//                          out_narrowed_cap_slot) -> u64
+//
+//   dev_cap                  KIND_BLOCK_DEVICE cap slot (the volume's
+//                              backing block device, from which a fresh
+//                              KIND_VOLUME cap is minted).
+//   elevate_channel_slot     0 (sentinel) = no elevate; the invoker
+//                              relies on its OWN rights on dev_cap. A
+//                              non-zero value is a KIND_ELEVATE_CHANNEL
+//                              cap slot -- libpdx-volume will issue an
+//                              elevate-broker request for the tier this
+//                              call implies before proceeding with the
+//                              mint.
+//   out_narrowed_cap_slot    u64 write target; receives the fresh
+//                              KIND_VOLUME slot on LPV_VK_OK.
+//
+// Return: LPV_VK_OK (0), LPV_VK_ERR_INSUFFICIENT_RIGHTS (1),
+// LPV_VK_ERR_ELEVATE_DENIED (2), LPV_VK_ERR_ELEVATE_TIMEOUT (3), or
+// LPV_STUB_NOT_IMPLEMENTED (0xFFFF...FFFF) at the current v1.1.0
+// landing (body is still stubbed until the kernel-side ring-3
+// KIND_VOLUME mint syscall lands + libpdx-elevate is link-resolvable).
+//
+// ----------------------------------------------------------------------
+// Tier-aware elevate selection
+// ----------------------------------------------------------------------
+//
+// design/tooling/volume-tooling-ux.md §4.2 already partitions mount
+// points into a three-way tier via Elevate::mount_point_class:
+//
+//   MPC_USER_SUBTREE (0)   /home/**, /mnt/**, /tmp/**    -> no elevate
+//   MPC_SYSTEM_PATH  (1)   /system/**, /boot/**, /dev/** -> elevate
+//   MPC_CROSS_USER   (2)   another user's /home/**       -> elevate
+//                                                            (unreachable
+//                                                            at this
+//                                                            landing --
+//                                                            no KIND_USER
+//                                                            identity
+//                                                            lookup yet)
+//   MPC_INVALID      (3)   anything else                  -> refuse
+//
+// This module's `mint_wire_elevate_slot_for_tier` maps that class into
+// the elevate_channel_slot argument for vol_kind_mint_elevate: 0 on
+// MPC_USER_SUBTREE (no elevate needed), the process's own held
+// KIND_ELEVATE_CHANNEL slot on the two elevate-needed tiers, and 0 on
+// MPC_INVALID (unreachable in practice -- main.pdx refuses INVALID
+// paths before ever reaching mint).
+//
+// ----------------------------------------------------------------------
+// LPV_E_NO_ELEVATE -- the "system tier without an elevate cap" refusal
+// ----------------------------------------------------------------------
+//
+// If mount.pdxfs is invoked against a system-tier path but has never
+// been provisioned with a KIND_ELEVATE_CHANNEL cap (the situation
+// today, per src/elevate.pdx's fail-closed stub note), refusing at the
+// mint call site with a documented sentinel is friendlier than
+// silently passing 0 into vol_kind_mint_elevate and getting an
+// insufficient-rights refusal back one abstraction layer down. This
+// module reuses libpdx-volume's LPV_E_VK_ELEVATE_DENIED (0x0103) as
+// that sentinel -- there is no separate LPV_E_NO_ELEVATE in
+// lpv_errors.pdx today, and the operator-visible outcome is
+// equivalent (elevation was needed and could not be obtained).
+// mount.pdxfs's own MR_RESULT_NO_ELEVATE (see src/mount_record.pdx)
+// is the tool-side classification that surfaces this in the emitted
+// PdxFsMountRecord.
+//
+// ----------------------------------------------------------------------
+// Encoder-gap discipline
+// ----------------------------------------------------------------------
+//
+// No `add reg,[mem]`. No `test`; every zero-check is `cmp reg, 0`.
+// Reserved-label discipline: every branch label prefixed `mount_mw_`.
+//
+// Upstream: paideia-satellites/libpdx-volume v1.1.0 (issue #23);
+// design/tooling/volume-tooling-ux.md §4.2, §9.4.
+
+module MintWire = structure {
+
+  // --- Return codes surfaced by this module (mount.pdxfs's own
+  //     mint-wire vocabulary, distinct from libpdx-volume's LPV_VK_*
+  //     which are also reported verbatim on library-side failures). --
+  pub let MW_OK                     : u64 = 0
+  pub let MW_ERR_NO_ELEVATE         : u64 = 1
+  pub let MW_ERR_LIBPDX_VK          : u64 = 2   // library returned a non-zero LPV_VK_* -- see out param below
+
+  // --- The elevate channel slot this process holds, if any.
+  //     PLACEHOLDER: `mount_mw_elevate_slot` is a .bss u64 initialised
+  //     to 0 (sentinel = "no elevate cap provisioned"). Once the
+  //     paideia-os monorepo's boot-time cap-seeding convention grows
+  //     an _init_caps hook for standalone CLI tools (see caps.decl's
+  //     KIND_ELEVATE_CHANNEL note, unchanged since M1), that hook
+  //     writes the real slot number here at process init. Until then,
+  //     every system-tier mount refuses with MW_ERR_NO_ELEVATE. -----
+  pub let mut mount_mw_elevate_slot : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // mint_wire_elevate_slot_for_tier(mpc_class) -> u64
+  //     (0 = no elevate; nonzero = KIND_ELEVATE_CHANNEL slot to pass
+  //      to vol_kind_mint_elevate)
+  //
+  //   rdi = mpc_class  (Elevate::MPC_USER_SUBTREE / MPC_SYSTEM_PATH /
+  //                      MPC_CROSS_USER / MPC_INVALID, from
+  //                      Elevate::mount_point_class)
+  //
+  // Returns the process's own held KIND_ELEVATE_CHANNEL slot when the
+  // tier calls for it (MPC_SYSTEM_PATH or MPC_CROSS_USER), or 0
+  // otherwise. Pure leaf, no branch beyond a single class compare.
+  // ==========================================================================
+  pub let mint_wire_elevate_slot_for_tier : (u64) -> u64 !{mem} @{} =
+    fn (mpc_class: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "mount.pdxfs.M6-002 (#22): mint_wire_elevate_slot_for_tier entry point. Pure leaf. cmp rdi,1 (MPC_SYSTEM_PATH); je have_slot. cmp rdi,2 (MPC_CROSS_USER); je have_slot. xor rax,rax; ret (no elevate). have_slot: mov rax,[rip+mount_mw_elevate_slot]; ret (the .bss slot, initialised to 0 until a real cap-seeding hook lands -- module header). No push/pop. No `add reg,[mem]`. No `test`. Labels prefixed mount_mw_.",
+      block: {
+        cmp rdi, 1;                          // MPC_SYSTEM_PATH
+        je mount_mw_have_slot;
+        cmp rdi, 2;                          // MPC_CROSS_USER
+        je mount_mw_have_slot;
+
+        xor rax, rax;                        // no elevate needed
+        ret;
+
+      mount_mw_have_slot:
+        mov rax, [rip + mount_mw_elevate_slot];
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // mint_wire_invoke(dev_cap, mpc_class, out_narrowed_cap_slot) -> u64
+  //     (MW_OK | MW_ERR_NO_ELEVATE | MW_ERR_LIBPDX_VK)
+  //
+  //   rdi = dev_cap                (KIND_BLOCK_DEVICE cap slot; source
+  //                                  for the fresh KIND_VOLUME mint)
+  //   rsi = mpc_class              (Elevate::MPC_*, drives elevate
+  //                                  selection)
+  //   rdx = out_narrowed_cap_slot  (u64 write target; receives the
+  //                                  new KIND_VOLUME slot on MW_OK;
+  //                                  untouched on any failure)
+  //
+  // On a system-tier mount without a provisioned elevate slot, refuses
+  // BEFORE calling libpdx-volume (returns MW_ERR_NO_ELEVATE). On a
+  // legal (user-tier or elevate-provisioned system-tier) call, invokes
+  // vol_kind_mint_elevate and maps its return: LPV_VK_OK -> MW_OK,
+  // anything else -> MW_ERR_LIBPDX_VK. The raw LPV_VK_* value is NOT
+  // surfaced through this function's own return (which would collide
+  // with MW_*); callers wanting the library-side code should call
+  // vol_kind_mint_elevate directly or read a follow-up out-param -- a
+  // shape change deferred until a caller actually needs the split.
+  // ==========================================================================
+  pub let mint_wire_invoke : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (dev_cap: u64) (mpc_class: u64) (out_narrowed_cap_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "mount.pdxfs.M6-002 (#22): mint_wire_invoke entry point. 3-push callee-save plan (rbx=dev_cap, r12=mpc_class, r13=out_narrowed_cap_slot). Entry rsp%16==8, 3 pushes 24B -> rsp%16==0 for both nested calls (mint_wire_elevate_slot_for_tier, vol_kind_mint_elevate). Refuse gate: for MPC_SYSTEM_PATH (1) or MPC_CROSS_USER (2), require nonzero elevate slot; else MW_ERR_NO_ELEVATE. User-tier (any other mpc_class) skips the slot requirement and goes straight to mint. do_mint: rdi=dev_cap, rsi=elevate_slot, rdx=out_narrowed_cap_slot; call vol_kind_mint_elevate. rax==0 (LPV_VK_OK) -> MW_OK; else -> MW_ERR_LIBPDX_VK. All exits pop r13/r12/rbx in reverse. No `add reg,[mem]`; no `test`; labels prefixed mount_mw_iv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // rbx = dev_cap
+        mov r12, rsi;                        // r12 = mpc_class
+        mov r13, rdx;                        // r13 = out_narrowed_cap_slot
+
+        // ---- Ask for the tier's elevate slot (0 for user-tier). ---------
+        mov rdi, r12;
+        call mint_wire_elevate_slot_for_tier;
+        // rax = elevate slot (0 if none held / none needed).
+
+        // ---- Refuse-gate: system-tier + no slot -> MW_ERR_NO_ELEVATE. ----
+        cmp r12, 1;                          // MPC_SYSTEM_PATH
+        je mount_mw_iv_check_slot;
+        cmp r12, 2;                          // MPC_CROSS_USER
+        je mount_mw_iv_check_slot;
+        jmp mount_mw_iv_do_mint;             // user-tier: fall through
+
+      mount_mw_iv_check_slot:
+        cmp rax, 0;
+        jne mount_mw_iv_do_mint;
+
+        // No elevate cap provisioned for this system-tier mount. Refuse.
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 1;                          // MW_ERR_NO_ELEVATE
+        ret;
+
+      mount_mw_iv_do_mint:
+        // ---- Real call into libpdx-volume. -----------------------------
+        mov rdi, rbx;                        // dev_cap
+        mov rsi, rax;                        // elevate_channel_slot
+        mov rdx, r13;                        // out_narrowed_cap_slot
+        call vol_kind_mint_elevate;
+
+        cmp rax, 0;                          // LPV_VK_OK
+        jne mount_mw_iv_lib_err;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        xor rax, rax;                        // MW_OK
+        ret;
+
+      mount_mw_iv_lib_err:
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 2;                          // MW_ERR_LIBPDX_VK
+        ret;
+      }
+    }
+}

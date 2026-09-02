@@ -32,11 +32,16 @@
 //             ("/etc/foo") -> Elevate::MPC_INVALID (3), which main.pdx
 //             maps to result_code MR_RESULT_INVALID_MOUNT_POINT (5).
 //   Case 3 -- a `/system/**` mount point ("/system/bar") ->
-//             Elevate::MPC_SYSTEM_PATH (1), then Elevate::mount_elev_
-//             require_system's fail-closed MOUNT_ELEV_DENY (0), which
-//             main.pdx maps to result_code MR_RESULT_ELEVATION_STUB (4)
-//             -- see src/elevate.pdx's own module header for the full
-//             write-up.
+//             Elevate::MPC_SYSTEM_PATH (1). This test exercises the
+//             legacy Elevate::mount_elev_require_system helper directly
+//             (fail-closed MOUNT_ELEV_DENY = 0) which is still called
+//             here for wire-format compat testing. NOTE (v1.1.1): the
+//             production main.pdx pipeline no longer calls this helper;
+//             it now dispatches through mint_wire_invoke and maps a
+//             /system/** mount without a provisioned elevate slot to
+//             MR_RESULT_NO_ELEVATE (16), not the legacy MR_RESULT_
+//             ELEVATION_STUB (4). See src/elevate.pdx + src/mint_wire.
+//             pdx module headers for the full v1.1.1 write-up.
 //   Case 4 -- a well-formed real-mount attempt against the still-
 //             unwired kernel ("cap:volume:0x7" resolving via VC_OK,
 //             "/mnt/z" as the mount point, no `--dry-run`) ->
