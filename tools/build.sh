@@ -17,20 +17,34 @@
 # never part of the linked binary) are linked with GNU ld against link.ld
 # into build-out/mount.pdxfs.elf, mirroring paideia-os's own
 # tools/build-user.sh convention (`ld -nostdlib --warn-common
-# --fatal-warnings -T <script> -o <out> <objects>`). Pass one or more
-# repeatable --extra-obj-dir DIR flags to fold in additional .o files
-# built out-of-tree (e.g. a libpdx-* support object); each DIR is globbed
-# for "*.o" at link time -- a DIR that does not exist or has no .o files
-# contributes nothing and is NOT an error. Linking runs whenever
-# compilation succeeded and produced at least one object, independent of
-# whether any --extra-obj-dir was given.
+# --fatal-warnings --gc-sections -T <script> -o <out> <objects>`). Pass
+# one or more repeatable --extra-obj-dir DIR flags to fold in additional
+# .o files built out-of-tree (e.g. a libpdx-* support object); each DIR
+# is globbed for "*.o" at link time -- a DIR that does not exist or has
+# no .o files contributes nothing and is NOT an error. Linking runs
+# whenever compilation succeeded and produced at least one object,
+# independent of whether any --extra-obj-dir was given.
 #
-# Usage: tools/build.sh [--extra-obj-dir DIR]...
+# --extra-archive PATH (repeatable) appends static archives (`.a`) to
+# the final `ld` link line AFTER the --extra-obj-dir objects
+# (paideia-os#2226, satellite-runtime-shim design §4.1/§5). Archives on
+# the link line are pulled in AS-NEEDED (unlike loose objects, which
+# link unconditionally); `--gc-sections` then prunes unused Rust symbols
+# from the Phase A/B satellite-runtime + audit-satellite archives so
+# they never reach the output ELF. Standard invocation:
+#
+#   bash tools/build.sh \
+#     --extra-obj-dir ../libpdx-volume/build-out \
+#     --extra-archive .../libpaideia_satellite_runtime.a \
+#     --extra-archive .../libpdx-audit-satellite.a
+#
+# Usage: tools/build.sh [--extra-obj-dir DIR]... [--extra-archive PATH]...
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 EXTRA_OBJECTS=()
+EXTRA_ARCHIVES=()
 OWN_OBJECTS=()
 
 while [ "$#" -gt 0 ]; do
@@ -44,6 +58,11 @@ while [ "$#" -gt 0 ]; do
                 EXTRA_OBJECTS+=("$extra_obj")
             done
             shopt -u nullglob
+            shift 2
+            ;;
+        --extra-archive)
+            [ "$#" -ge 2 ] || { echo "[build] FAIL: --extra-archive requires an argument" >&2; exit 2; }
+            EXTRA_ARCHIVES+=("$2")
             shift 2
             ;;
         *)
@@ -123,10 +142,10 @@ echo "[build] OK"
 
 if [ "$FAIL" -eq 0 ] && [ "${#OWN_OBJECTS[@]}" -gt 0 ]; then
     echo "[link] ld -T link.ld -> $BUILD_DIR/mount.pdxfs.elf"
-    ld -nostdlib --warn-common --fatal-warnings \
+    ld -nostdlib --warn-common --fatal-warnings --gc-sections \
         -T link.ld \
         -o "$BUILD_DIR/mount.pdxfs.elf" \
-        "${OWN_OBJECTS[@]}" "${EXTRA_OBJECTS[@]}"
+        "${OWN_OBJECTS[@]}" "${EXTRA_OBJECTS[@]}" "${EXTRA_ARCHIVES[@]}"
     echo "[link] OK -> $BUILD_DIR/mount.pdxfs.elf"
 
     if command -v objcopy >/dev/null 2>&1; then
