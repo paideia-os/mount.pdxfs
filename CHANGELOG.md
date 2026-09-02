@@ -1,5 +1,68 @@
 # mount.pdxfs — CHANGELOG
 
+## 1.1.3 — 2026-09-02 (ENH-030: libpdx-argv adoption — replaces handwritten scanner)
+
+**Patch bump — no observable behaviour change for well-formed input;
+every exit code + stderr diagnostic preserved.** Replaces the
+handwritten long-flag scanner in `src/argv.pdx` with a thin wire-in
+over paideia-satellites/libpdx-argv v1.1.0 (ENH-030 rename tag). Every
+public symbol callers depend on — the `argv_parse` entry point, the
+`PA_OFF_*` / `PA_FLAG_*` / `PA_STRUCT_BYTES` constants, and every
+`ARGV_ERR_*` return code — keeps its numeric value and its byte
+offset unchanged, so `src/main.pdx`'s direct-offset loads at
+`[r14 + 0]` / `[r14 + 8]` / `[r14 + 16]` / `[r14 + 24]` and
+`tests/test_happy_mnt.pdx`'s `thm_parsed: [u8; 24]` buffer with
+reads at +8/+16 continue to work byte-for-byte.
+
+### Added
+
+- **libpdx-argv wire-in** — `argv_parse` now registers the 8
+  mount.pdxfs long flags with `flag_spec_register()` (each bound to a
+  `FID_*` in the 100..107 range and a `FKIND_BOOL` / `FKIND_INT` value
+  kind), drives `parse_argv(argv+8, argc-1)`, then walks
+  `flag_ids[0..flag_count)` once to populate the caller's 48-byte
+  ParsedArgv struct. `--snapshot=<slot>` still ORs both
+  PA_FLAG_SNAPSHOT_SET (0x40) AND PA_FLAG_RO (0x1) into flags as
+  0x41 — the "snap mount is RO" invariant preserved verbatim.
+- **passphrase_fd = -1 sentinel** — the shim's zero-init pass writes
+  the i64 unset-sentinel 0xFFFFFFFFFFFFFFFF into PA_OFF_PASSPHRASE_FD
+  (+32) via `mov r10, 0xFFFFFFFFFFFFFFFF; mov [rbx+32], r10`,
+  preserving the pre-shim distinction between "explicitly set to
+  fd 0" and "left unset" for downstream unlock-hop dispatch.
+- **Flag-name literals** — new NUL-terminated `[u8; N]` names in
+  .rodata (`mount_argv_name_ro`, `_noexec`, `_verbose`, `_dry_run`,
+  `_all`, `_snapshot_list`, `_snapshot`, `_passphrase_fd`).
+
+### Removed
+
+- **Handwritten scanner** — `argv_streq`, `argv_prefix_match`,
+  `argv_parse_u64_dec`, and every `argv_lit_*` literal deleted.
+
+### Behaviour notes
+
+- **Relax-gates preserved**: `--all` overrides both positional
+  checks; `--snapshot=<slot>` skips the volume-cap check;
+  `--snapshot-list` skips the mount-point check. Return codes
+  (ARGV_OK / ARGV_ERR_MISSING_VOLUME_CAP=1 / ARGV_ERR_MISSING_MOUNT_
+  POINT=2) fire on identical inputs as the pre-shim body.
+- **`--snapshot=<slot>` implies RO** — the shim OR's 0x41
+  (PA_FLAG_SNAPSHOT_SET | PA_FLAG_RO) into flags on a match,
+  matching pre-shim v1.1.2's `or rax, 0x41` idiom.
+- **Malformed `--snapshot=abc` / `--passphrase-fd=abc`**: shim
+  leaves the default in place (0 for snapshot_slot, -1 for
+  passphrase_fd) and does NOT latch the presence bit. Pre-shim
+  latched with a zero value; observationally equivalent for callers
+  that consult only the value slot.
+
+### Build
+
+- **`bash tools/build.sh --extra-obj-dir ../libpdx-argv/build-out
+  ...`** — the standing invocation must now include libpdx-argv's
+  build-out alongside libpdx-volume's.
+
+Closes #25 (satellite adoption of libpdx-argv). Depends on
+libpdx-argv v1.1.0 (ENH-030 rename).
+
 ## 1.1.2 — 2026-09-02 (Phase C: `--extra-archive` + `--gc-sections` for satellite-runtime link)
 
 **Patch bump — additive `tools/build.sh` flag; every existing invocation

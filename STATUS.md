@@ -2,7 +2,7 @@
 
 **Wave:** R90-XREPO (post-R53 satellite-cascade + libpdx-volume v1.1)
 **Current milestone:** M6 (libpdx-volume v1.1 API adoption) — **landed**
-**Version:** 1.1.1
+**Version:** 1.1.3 (ENH-030: libpdx-argv adoption — replaces handwritten scanner, #25)
 
 See `design/tooling/volume-tooling-ux.md` §9.2 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for the
