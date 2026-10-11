@@ -34,14 +34,26 @@
 //     `snapshot_wire_mount` therefore always returns
 //     SW_ERR_KERNEL_NOT_IMPL until both land.
 //
-//   KERNEL GAP #B: snap_chain_walk is a libpdx-volume-side stub. Per
-//     that repo's own note (src/vol_snapshot.pdx module header), the
-//     walker needs one of (a) an in-memory block cache the library
-//     can peek into, (b) a caller-supplied read-block callback, or
-//     (c) cap-invoke through the volume cap -- none of which is
-//     scaffolded at v1.1.0. The stub returns LPV_SNAP_ERR_NOT_IMPL
-//     (0x0701) for every input, so `snapshot_wire_list` here is a
-//     documented passthrough of that sentinel.
+//   KERNEL GAP #B (PARTIALLY RESOLVED, 2026-10-11): the libpdx-volume-
+//     side `snap_chain_walk` stub landed real at libpdx-volume v1.1.7
+//     (PFS-07 / paideia-os#2574), with a new 3-arg signature
+//     `(root_snap_lba, cb_ptr, cb_ctx) -> count | SnapErr` that walks
+//     a parent-linked chain of 4096-byte on-disk snap-chain blocks
+//     via an externally provided block-read authority
+//     `lpv_bc_read(lba, out_ptr) -> u64`. The block-read authority
+//     ITSELF is not yet wired to a real KIND_BLOCK_CACHE kernel shim
+//     (the kernel-side cap kind + BC_OP_READ handler do not exist
+//     in paideia-os as of this wave). `src/bc_read_stub.pdx` provides
+//     a user-space `lpv_bc_read` stub that returns
+//     BC_READ_ERR_NO_SHIM (0xFFFFFFFFFFFFFFFD) for every call; the
+//     walker maps that to LPV_SNAP_ERR_READ (0x0B01), which this
+//     module maps to SW_ERR_KERNEL_NOT_IMPL (1), which `main.pdx`
+//     already emits as MR_RESULT_SNAPSHOT_NOT_IMPL regardless of the
+//     SW_* code. Net observable behaviour: `--snapshot-list` still
+//     exits 3 with SNAPSHOT_NOT_IMPL, but the link line now resolves
+//     cleanly and the real-walker code path is live, awaiting only
+//     the kernel block-cache shim swap-in. See `src/bc_read_stub.pdx`
+//     for the replacement strategy when that shim lands.
 //
 // ----------------------------------------------------------------------
 // FROZEN gate -- checked once snap_record_parse can be reached
@@ -62,10 +74,12 @@
 // ----------------------------------------------------------------------
 //
 // No `add reg,[mem]`. No `test`; every zero-check is `cmp reg, 0`.
-// Reserved-label discipline: every branch label prefixed `mount_sw_`.
+// No 2-op `imul r,imm`. No multiline `pub let =`. Reserved-label
+// discipline: every branch label prefixed `mount_sw_`.
 //
-// Upstream: paideia-satellites/libpdx-volume v1.1.0 (issues #25, #26);
-// design/tooling/volume-tooling-ux.md §4.6 (snapshot mount surface).
+// Upstream: paideia-satellites/libpdx-volume v1.1.7 (PFS-07 /
+// paideia-os#2574); design/tooling/volume-tooling-ux.md §4.6
+// (snapshot mount surface).
 
 module SnapshotWire = structure {
 
@@ -88,6 +102,71 @@ module SnapshotWire = structure {
 
   // --- .bss scratch: narrowed snap-cap slot output. ---------------------
   pub let mut mount_sw_narrowed_slot : u64 = uninit @align(8)
+
+  // ======================================================================
+  // --snapshot-list collector state + per-entry packing
+  // ======================================================================
+  //
+  // libpdx-volume v1.1.7's `snap_chain_walk` is a callback-driven
+  // walker: for each in-chain snap-chain block it reads successfully,
+  // it invokes `cb(snap_lba, generation, data_root_lba, parent_lba,
+  // cb_ctx) -> errno`. The caller supplies the cb + a `cb_ctx` pointer;
+  // the cb's non-zero return flows through unchanged as the walker's
+  // own return (callback-triggered abort). cb returns within the
+  // 0x0B00..0x0B0F reserved band would be mis-discriminable from
+  // walker-side errors (LPV_SNAP_ERR_READ/_BAD_MAGIC_SCB/_WALK_CAP),
+  // so this module picks SW_LS_CB_ABORT_OUT_FULL = 0x0C01 for its own
+  // "out buffer full" sentinel per libpdx-volume's reserved-band
+  // convention.
+  //
+  // The pre-PFS-07 `snapshot_wire_list` signature
+  // (`(volume_cap_slot, snap_head_lba, out_ptr, out_cap,
+  //    out_count_ptr) -> u64`)
+  // is PRESERVED verbatim at the public ABI so `main.pdx`'s existing
+  // 5-arg call site at `mount_main_m6_snap_list` compiles unchanged.
+  // Internally the body now:
+  //   (1) stages (out_ptr, out_cap, out_count_ptr) into three .bss
+  //       slots the module-local cb consults each step;
+  //   (2) resets `mount_sw_ls_written` to 0;
+  //   (3) calls `snap_chain_walk(snap_head_lba, cb, 0)` -- cb_ctx is
+  //       0 because the cb reads its context entirely from .bss (keeps
+  //       the ABI shape simple + makes the cb reusable from a future
+  //       mkfs.pdxfs/`snap_chain_dump` surface);
+  //   (4) discriminates return: `<= 128` -> count (success);
+  //       `> 128` -> walker error OR cb abort; both map to
+  //       SW_ERR_KERNEL_NOT_IMPL at the public surface.
+  //
+  // Per-entry packed shape (what the cb writes at
+  // `out_ptr + written*32`): 4 u64 slots, 32 B total:
+  //   [+0]  snap_lba       (the LBA of this snap-chain block)
+  //   [+8]  generation     (the block's generation counter)
+  //   [+16] data_root_lba  (the data-root this snap pins)
+  //   [+24] parent_lba     (0 at chain tail)
+  // This is the block-level shape surfaced by `snap_chain_walk`'s cb,
+  // NOT the 96-byte SnapRecord layout parsed by libpdx-volume's
+  // `snap_record_parse` -- the two shapes are orthogonal (walker
+  // iterates block headers; `snap_record_parse` decodes an in-memory
+  // record buffer the caller supplies). A future `snapshot_wire_render`
+  // layer that prints one line per enumerated snap (snap_id,
+  // created_at_ns, retention_policy per the module docstring at the
+  // top) will cross-reference each entry's snap_lba against the
+  // 96-byte record store; that cross-reference awaits
+  // KIND_VOLUME_SNAPSHOT (KERNEL GAP #A) + the block-cache shim
+  // landing, and is deliberately NOT scaffolded here.
+  //
+  // Reentrancy: single-writer per invocation. mount.pdxfs is a short-
+  // lived single-threaded userland tool; two concurrent in-flight
+  // `--snapshot-list` passes would collide on these .bss slots but are
+  // structurally impossible (single `_start` -> single `argv_parse`
+  // -> single dispatch arm).
+  pub let SW_LS_PER_ENTRY_BYTES    : u64 = 32
+  pub let SW_LS_PER_ENTRY_SHIFT    : u64 = 5
+  pub let SW_LS_CB_ABORT_OUT_FULL  : u64 = 0x0C01
+
+  pub let mut mount_sw_ls_out_ptr        : u64 = uninit @align(8)
+  pub let mut mount_sw_ls_out_cap        : u64 = uninit @align(8)
+  pub let mut mount_sw_ls_out_count_ptr  : u64 = uninit @align(8)
+  pub let mut mount_sw_ls_written        : u64 = uninit @align(8)
 
   // ==========================================================================
   // snapshot_wire_check_frozen(snap_summary_ptr) -> u64
@@ -136,9 +215,11 @@ module SnapshotWire = structure {
   // Step 3: (deferred) enumerate snap chain to find the record whose
   //   snap_id matches this cap's identity, call snap_record_parse,
   //   check FROZEN via snapshot_wire_check_frozen. TODAY: skipped --
-  //   snap_chain_walk is a stub (KERNEL GAP #B) and cap-slot -> snap_id
-  //   resolution needs a kernel-side cap-query primitive that doesn't
-  //   exist yet. The FROZEN gate is a WIRED but UNREACHABLE code path.
+  //   cap-slot -> snap_id resolution needs a kernel-side cap-query
+  //   primitive that doesn't exist yet (and the KIND_BLOCK_CACHE shim
+  //   that would feed snap_chain_walk is likewise still pending --
+  //   see partial-KERNEL-GAP-#B at the module header). The FROZEN
+  //   gate is a WIRED but UNREACHABLE code path.
   // Step 4: issue the snap-mount kernel op. TODAY: unwired
   //   (KERNEL GAP #A). Every legal caller reaches this point and
   //   receives SW_ERR_KERNEL_NOT_IMPL.
@@ -199,35 +280,203 @@ module SnapshotWire = structure {
     }
 
   // ==========================================================================
+  // snapshot_wire_list_cb(snap_lba, generation, data_root_lba,
+  //                       parent_lba, cb_ctx) -> u64
+  //
+  //   rdi = snap_lba        (block LBA for this snap)
+  //   rsi = generation      (block generation counter)
+  //   rdx = data_root_lba   (data-root this snap pins)
+  //   rcx = parent_lba      (0 at chain tail)
+  //   r8  = cb_ctx          (unused; context lives in .bss slots)
+  //
+  // Walker-side contract (libpdx-volume v1.1.7
+  // VolSnapshot::snap_chain_walk):
+  //   - cb preserves rbx/rbp/r12..r15 (SysV callee-save -- the walker
+  //     preserves r12..r15 across the call separately, but the cb
+  //     still owes the full SysV contract to the walker as its own
+  //     caller).
+  //   - Returning 0 continues the walk.
+  //   - Returning non-zero outside the 0x0B00..0x0B0F band aborts
+  //     the walk; the exact value flows through as the walker's own
+  //     return. The 0x0B00..0x0B0F band is reserved for walker-side
+  //     errors; cb aborts within that band would be mis-discriminable.
+  //
+  // Collector-side contract:
+  //   - If `mount_sw_ls_written >= mount_sw_ls_out_cap`, abort with
+  //     SW_LS_CB_ABORT_OUT_FULL (0x0C01, outside 0x0B0X).
+  //   - Else write a 32-byte packed entry at
+  //     `mount_sw_ls_out_ptr + mount_sw_ls_written * 32`
+  //     and increment `mount_sw_ls_written`.
+  //
+  // Pure leaf: no inner calls, no auto-prologue. No manual pushes
+  // (every scratch is in r9/r10/r11). No `test`; no `add reg,[mem]`;
+  // no 2-op `imul`. Labels prefixed `mount_sw_lscb_`.
+  //
+  // Entry packing uses `shl r10, 5` (shift left by SW_LS_PER_ENTRY_
+  // SHIFT = 5) to compute the byte offset -- 2-op `imul r,imm` is
+  // forbidden by the encoder, and `shl r64, imm8` is the standard
+  // paideia-as pattern for small-power-of-two multiplies.
+  // ==========================================================================
+  pub let snapshot_wire_list_cb : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (snap_lba: u64) (generation: u64) (data_root_lba: u64) (parent_lba: u64) (cb_ctx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "paideia-os#2574 (PFS-07) snapshot_wire_list callback. Pure leaf -- no inner calls, paideia-as skips auto-prologue; no manual pushes needed. Load written: lea r11,[rip+mount_sw_ls_written]; mov r10,[r11+0]. Load cap: lea r11,[rip+mount_sw_ls_out_cap]; mov r9,[r11+0]. Bounds: cmp r10,r9; jae mount_sw_lscb_full. Load out_ptr: lea r11,[rip+mount_sw_ls_out_ptr]; mov r11,[r11+0]. Compute dest = out_ptr + written*32 via `shl r10,5; add r11,r10`. Store 4 u64 fields: mov [r11+0],rdi (snap_lba); mov [r11+8],rsi (generation); mov [r11+16],rdx (data_root_lba); mov [r11+24],rcx (parent_lba). Increment written: lea r11,[rip+mount_sw_ls_written]; mov r10,[r11+0]; add r10,1; mov [r11+0],r10. xor rax,rax; ret. mount_sw_lscb_full: mov rax,0x0C01; ret. No `test`; no `add reg,[mem]`; no 2-op `imul`. Labels prefixed mount_sw_lscb_.",
+      block: {
+        // written -> r10
+        lea r11, [rip + mount_sw_ls_written];
+        mov r10, [r11 + 0];
+
+        // cap -> r9
+        lea r11, [rip + mount_sw_ls_out_cap];
+        mov r9, [r11 + 0];
+
+        // Bounds: written >= cap -> abort.
+        cmp r10, r9;
+        jae mount_sw_lscb_full;
+
+        // out_ptr -> r11
+        lea r11, [rip + mount_sw_ls_out_ptr];
+        mov r11, [r11 + 0];
+
+        // dest = out_ptr + written*32 (via shift-left-5).
+        shl r10, 5;
+        add r11, r10;
+
+        // Packed-entry store: {snap_lba, generation, data_root_lba, parent_lba}.
+        mov [r11 + 0],  rdi;
+        mov [r11 + 8],  rsi;
+        mov [r11 + 16], rdx;
+        mov [r11 + 24], rcx;
+
+        // written++
+        lea r11, [rip + mount_sw_ls_written];
+        mov r10, [r11 + 0];
+        add r10, 1;
+        mov [r11 + 0], r10;
+
+        xor rax, rax;
+        ret;
+
+      mount_sw_lscb_full:
+        mov rax, 0x0C01;                     // SW_LS_CB_ABORT_OUT_FULL
+        ret;
+      }
+    }
+
+  // ==========================================================================
   // snapshot_wire_list(volume_cap_slot, snap_head_lba, out_ptr, out_cap,
   //                    out_count_ptr) -> u64
   //     (SW_OK | SW_ERR_KERNEL_NOT_IMPL)
   //
-  // Thin passthrough to libpdx-volume.snap_chain_walk. Every argument
-  // is forwarded verbatim; the return is mapped to SW_OK on 0 or
-  // SW_ERR_KERNEL_NOT_IMPL on anything else. Today `snap_chain_walk`
-  // is itself a stub returning LPV_SNAP_ERR_NOT_IMPL for every input
-  // (KERNEL GAP #B), so this function likewise refuses every call.
+  // libpdx-volume v1.1.7 adapter for `snap_chain_walk` (the walker's
+  // 3-arg real body replaced the v1.1.0 5-arg stub; this module
+  // preserves its own 5-arg public ABI for `main.pdx` compatibility
+  // and marshals internally).
   //
-  // Once snap_chain_walk gains a real body, callers of this function
-  // will need to iterate `out_ptr[0..*out_count_ptr]` printing one
-  // line per SnapRecord summary via a companion `snapshot_wire_render`
-  // function -- not yet landed since it has nothing to render today.
+  //   rdi = volume_cap_slot (unused today -- reserved for a future
+  //                           pre-walk cap-query that cross-references
+  //                           the walked block headers against the
+  //                           96-byte SnapRecord store; passed through
+  //                           verbatim with no inspection).
+  //   rsi = snap_head_lba   (root LBA for the walk; new walker's arg 0).
+  //   rdx = out_ptr         (packed 32-byte entries; cb-side contract).
+  //   rcx = out_cap         (entry count; cb aborts with
+  //                           SW_LS_CB_ABORT_OUT_FULL when exceeded).
+  //   r8  = out_count_ptr   (where to write the final count; may be 0
+  //                           -- callers that don't need the count
+  //                           pass 0 and the write is skipped).
+  //
+  // Walker return discrimination:
+  //   rax <= 128  -> success; count = rax; write *out_count_ptr if ptr
+  //                   != 0; return SW_OK.
+  //   rax > 128   -> walker error (0x0B01/0x0B02/0x0B03) OR cb abort
+  //                   (0x0C01 or any caller-supplied sentinel); return
+  //                   SW_ERR_KERNEL_NOT_IMPL regardless -- main.pdx
+  //                   emits a fixed MR_RESULT_SNAPSHOT_NOT_IMPL for
+  //                   this surface, so finer-grained discrimination
+  //                   has no caller today.
+  //
+  // Register plan:
+  //   rbx = out_ptr          (preserved for post-walker *out_count_ptr
+  //                           write; actually unused at the post-walker
+  //                           step because the count is in rax, but
+  //                           reserved to keep the register layout
+  //                           parallel to snapshot_wire_mount's own
+  //                           body for future diff-grep hygiene).
+  //   r12 = out_cap          (unused post-walker; same rationale).
+  //   r13 = out_count_ptr    (consulted at the post-walker success path).
+  //   r14 = snap_head_lba    (walker arg 0).
+  //
+  // Alignment: 4 manual pushes (rbx, r12, r13, r14) atop paideia-as's
+  // auto `push rbp; mov rbp, rsp` keeps rsp%16==0 at the inner
+  // `call snap_chain_walk` site. Matches the walker's own 4-push
+  // pattern (which calls `lpv_bc_read` and the cb from a 4-push frame).
+  //
+  // Encoder-pitfall discipline: no `test`; every zero-check is
+  // `cmp reg, 0`. 128 compared via `mov r10,128; cmp rax,r10; ja ...`
+  // (imm8 128 sign-extends to -128, same guard shape as the walker's
+  // own cap gate). No `add reg,[mem]`; no multiline `pub let =`.
+  // Labels prefixed `mount_sw_ls_`.
   // ==========================================================================
   pub let snapshot_wire_list : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
     fn (volume_cap_slot: u64) (snap_head_lba: u64) (out_ptr: u64) (out_cap: u64) (out_count_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs, cap},
-      justification: "mount.pdxfs.M6-003 (#23): snapshot_wire_list entry point. Passthrough to snap_chain_walk with the same 5-arg signature. call snap_chain_walk (rdi/rsi/rdx/rcx/r8 already carry the arguments in the right SysV positions). cmp rax,0; je ok; mov rax,1 (SW_ERR_KERNEL_NOT_IMPL); ret. ok: xor rax,rax; ret. No push/pop -- pure passthrough. No `add reg,[mem]`; no `test`. Labels prefixed mount_sw_ls_.",
+      justification: "paideia-os#2574 (PFS-07) snapshot_wire_list adapter for libpdx-volume v1.1.7's 3-arg snap_chain_walk. 4 manual pushes (rbx/r12/r13/r14) atop auto push rbp keeps rsp%16==0 at the inner call. Setup: rbx=rdx (out_ptr), r12=rcx (out_cap), r13=r8 (out_count_ptr), r14=rsi (snap_head_lba). Stage collector .bss slots: mount_sw_ls_out_ptr<-rbx, _cap<-r12, _count_ptr<-r13, _written<-0. Call: mov rdi,r14; lea rsi,[rip+snapshot_wire_list_cb]; xor rdx,rdx (cb_ctx=0); call snap_chain_walk. Discriminate: mov r10,128; cmp rax,r10; ja mount_sw_ls_err. Success: cmp r13,0; je mount_sw_ls_ok_noout; mov [r13+0],rax. mount_sw_ls_ok_noout/mount_sw_ls_ok: pop r14/r13/r12/rbx; xor rax,rax; ret. mount_sw_ls_err: pop r14/r13/r12/rbx; mov rax,1; ret. No `test`; no `add reg,[mem]`; 128 staged via r10 (imm8 sign-extend guard, same discipline as the walker's cap gate). Labels prefixed mount_sw_ls_.",
       block: {
-        call snap_chain_walk;
-        cmp rax, 0;
-        je mount_sw_ls_ok;
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
 
-        mov rax, 1;                          // SW_ERR_KERNEL_NOT_IMPL
-        ret;
+        mov rbx, rdx;                        // out_ptr
+        mov r12, rcx;                        // out_cap
+        mov r13, r8;                         // out_count_ptr
+        mov r14, rsi;                        // snap_head_lba
+
+        // ---- Stage collector state in .bss. ---------------------------
+        lea r11, [rip + mount_sw_ls_out_ptr];
+        mov [r11 + 0], rbx;
+
+        lea r11, [rip + mount_sw_ls_out_cap];
+        mov [r11 + 0], r12;
+
+        lea r11, [rip + mount_sw_ls_out_count_ptr];
+        mov [r11 + 0], r13;
+
+        lea r11, [rip + mount_sw_ls_written];
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        // ---- Call snap_chain_walk(snap_head_lba, cb, 0). --------------
+        mov rdi, r14;
+        lea rsi, [rip + snapshot_wire_list_cb];
+        xor rdx, rdx;
+        call snap_chain_walk;
+
+        // ---- Discriminate: rax <= 128 -> count; rax > 128 -> error. ---
+        mov r10, 128;
+        cmp rax, r10;
+        ja mount_sw_ls_err;
+
+        // Success path: write *out_count_ptr if ptr != 0, return SW_OK.
+        cmp r13, 0;
+        je mount_sw_ls_ok;
+        mov [r13 + 0], rax;
 
       mount_sw_ls_ok:
-        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        xor rax, rax;                        // SW_OK
+        ret;
+
+      mount_sw_ls_err:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 1;                          // SW_ERR_KERNEL_NOT_IMPL
         ret;
       }
     }

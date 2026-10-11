@@ -1,0 +1,101 @@
+// src/bc_read_stub.pdx — user-space stub for libpdx-volume's
+// `lpv_bc_read(lba, out_ptr) -> u64` extern (paideia-os#2574 / PFS-07
+// mount-side adaptation).
+//
+// -----------------------------------------------------------------------------
+// Why this exists
+// -----------------------------------------------------------------------------
+//
+// libpdx-volume v1.1.7 (PFS-07) replaced `snap_chain_walk`'s v1.1.0
+// 5-arg fail-closed stub with a real walker body whose per-step
+// block read is routed through an EXTERNALLY provided block-read
+// authority:
+//
+//     lpv_bc_read(lba: u64, out_ptr: u64) -> u64
+//         0  on success (4096 bytes written to [out_ptr..out_ptr+4096))
+//         !0 on error (walker reports LPV_SNAP_ERR_READ = 0x0B01)
+//
+// `lpv_bc_read` is an UNRESOLVED extern in libpdx-volume's own
+// `vol_snapshot.o` -- preserving its "zero cap-invoke syscalls in the
+// own call graph" discipline. The intended real-world provider is a
+// thin shim over KIND_BLOCK_CACHE's BC_OP_READ cap-invoke op; the
+// kernel-side cap kind + op dispatcher do not yet exist in the
+// paideia-os tree (KERNEL GAP #B in the earlier `snapshot_wire.pdx`
+// module header -- which this file documents as PARTIALLY resolved:
+// the walker body landed, the block-cache shim did not).
+//
+// Without a definition, `ld -nostdlib --warn-common --fatal-warnings`
+// (the mount.pdxfs link line) would refuse to produce an ELF because
+// `vol_snapshot.o` references the symbol and no other object defines
+// it. The link-fail cascade would then stage a 512B zero-filled
+// stub `mount.pdxfs.elf` into the kernel build via `tools/build.sh`'s
+// "individual tool failures are NON-FATAL" branch, hollowing out the
+// whole tool rather than just the one surface.
+//
+// Mirrors the established `tools/user-sign-stub.pdx` pattern
+// (paideia-os#1976): a user-space ELF cannot reach a Rust-runtime
+// extern-C thunk, so a stub emits a sentinel that the calling tool
+// routes to a STUB result_code. Here the "calling tool" is the walker
+// itself; it maps `lpv_bc_read` non-zero to `LPV_SNAP_ERR_READ`
+// (0x0B01), which `snapshot_wire_list` in turn maps to
+// `SW_ERR_KERNEL_NOT_IMPL` (1), which `main.pdx` already emits as
+// `MR_RESULT_SNAPSHOT_NOT_IMPL` regardless of the SW_* code -- so
+// mount.pdxfs's observable `--snapshot-list` behaviour is unchanged
+// (exit 3 + SNAPSHOT_NOT_IMPL emission) while the link line now
+// succeeds.
+//
+// -----------------------------------------------------------------------------
+// Return-code contract
+// -----------------------------------------------------------------------------
+//
+// Returns `BC_READ_ERR_NO_SHIM = 0xFFFFFFFFFFFFFFFD`, chosen two below
+// the sign-stub's PDXB_SIGN_STUB (0xFFFFFFFFFFFFFFFE) and the
+// verify-stub's 0xFFFFFFFFFFFFFFFF so a caller inspecting the
+// sentinel can discriminate across all three families. The walker
+// treats any non-zero return as `LPV_SNAP_ERR_READ`, so the exact
+// value is not load-bearing for walker semantics -- it IS load-bearing
+// for a future diagnostic tool that wants to tell "block-cache shim
+// is a stub" from "block-cache shim ran but the block was missing".
+//
+// -----------------------------------------------------------------------------
+// Replacement strategy
+// -----------------------------------------------------------------------------
+//
+// When the KIND_BLOCK_CACHE shim lands (paideia-os monorepo kernel
+// side), this file is removed from `src/` and replaced by a thin
+// `pdxb_bc_read.pdx` that cap-invokes BC_OP_READ. The replacement
+// MUST keep the same `(u64, u64) -> u64` signature + 0-is-success
+// convention; a mismatch produces a link-time error that is a louder
+// signal than a runtime surprise, same discipline as
+// `user-sign-stub.pdx` enforces for the signing stubs. Mount.pdxfs's
+// own `snapshot_wire_list` + the walker body stay unchanged across
+// that swap.
+//
+// -----------------------------------------------------------------------------
+// Encoder-pitfall discipline
+// -----------------------------------------------------------------------------
+//
+// Pure leaf, no auto-prologue. One instruction + ret. No `test`;
+// no `add reg,[mem]`; no multiline `pub let =`. Immediate is a full
+// 64-bit value loaded via `mov r64, imm64` (paideia-as emits the
+// 10-byte REX.W + MOV imm64 form). Labels: none needed.
+
+module BcReadStub = structure {
+
+  // Sentinel the walker observes as LPV_SNAP_ERR_READ-equivalent.
+  // Deliberately distinct from PDXB_SIGN_STUB (0xFF..FE) and
+  // PDXB_VER_ERR_NOT_IMPLEMENTED (0xFF..FF).
+  pub let BC_READ_ERR_NO_SHIM : u64 = 0xFFFFFFFFFFFFFFFD
+
+  // Signature mirrors libpdx-volume's own module-header declaration of
+  // the extern (vol_snapshot.pdx: `lpv_bc_read(lba, out_ptr) -> u64`).
+  pub let lpv_bc_read : (u64, u64) -> u64 !{} @{} =
+    fn (lba: u64) (out_ptr: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "paideia-os#2574 (PFS-07) user-space block-cache stub. Pure leaf, no manual pushes, no inner calls -- paideia-as skips the non-leaf auto-prologue. mov rax, 0xFFFFFFFFFFFFFFFD (BC_READ_ERR_NO_SHIM, 10-byte REX.W+MOV imm64); ret. Walker maps non-zero to LPV_SNAP_ERR_READ; snapshot_wire_list maps that to SW_ERR_KERNEL_NOT_IMPL; main.pdx emits MR_RESULT_SNAPSHOT_NOT_IMPL. Labels: none.",
+      block: {
+        mov rax, 0xFFFFFFFFFFFFFFFD;
+        ret;
+      }
+    }
+}

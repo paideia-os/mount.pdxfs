@@ -1,5 +1,88 @@
 # mount.pdxfs — CHANGELOG
 
+## 1.1.4 — 2026-10-11 (PFS-07 / paideia-os#2574: adapt snapshot_wire_list to libpdx-volume v1.1.7's 3-arg snap_chain_walk)
+
+**Patch bump — observable behaviour UNCHANGED (`--snapshot-list`
+still exits 3 with `MR_RESULT_SNAPSHOT_NOT_IMPL`). The pre-existing
+"KERNEL GAP #B" blocker (the libpdx-volume-side `snap_chain_walk`
+stub) has been PARTIALLY resolved by libpdx-volume v1.1.7's real
+walker body landing. The remaining blocker is now the kernel-side
+`KIND_BLOCK_CACHE` cap kind + `BC_OP_READ` handler, which this
+patch works around by providing a user-space `lpv_bc_read` stub
+so the link line resolves.**
+
+### Added
+
+- **`src/bc_read_stub.pdx`** (new file) —
+  `BcReadStub::lpv_bc_read(lba, out_ptr) -> u64` user-space stub
+  satisfying libpdx-volume v1.1.7's walker-side unresolved extern.
+  Returns `BC_READ_ERR_NO_SHIM = 0xFFFFFFFFFFFFFFFD` for every
+  call (distinct from the two sign-stub sentinels at `0xFF..FE`
+  and `0xFF..FF`). The walker maps the non-zero return to
+  `LPV_SNAP_ERR_READ` (0x0B01); `snapshot_wire_list` maps that to
+  `SW_ERR_KERNEL_NOT_IMPL` (1); `main.pdx` emits
+  `MR_RESULT_SNAPSHOT_NOT_IMPL` regardless, so the exit-code shape
+  is preserved. Mirrors the established `user-sign-stub.pdx`
+  user-space-stub-for-Rust-runtime-extern pattern
+  (paideia-os#1976). Removed + replaced by a real
+  `pdxb_bc_read.pdx` cap-invoke shim when the kernel-side
+  `KIND_BLOCK_CACHE` lands.
+- **`src/snapshot_wire.pdx`** — `SnapshotWire::snapshot_wire_list_cb`
+  (new 5-arg callback matching libpdx-volume v1.1.7's walker
+  contract: `cb(snap_lba, generation, data_root_lba, parent_lba,
+  cb_ctx) -> u64`). Pure leaf; packs each in-chain block header
+  into a 32-byte entry at `out_ptr + written * 32` ({+0 snap_lba,
+  +8 generation, +16 data_root_lba, +24 parent_lba}) with
+  bounds-checked abort at `written == out_cap` via
+  `SW_LS_CB_ABORT_OUT_FULL = 0x0C01` (outside the walker's
+  reserved 0x0B00..0x0B0F band so the caller can discriminate
+  walker errors from cb aborts).
+- **`src/snapshot_wire.pdx`** — four `.bss` collector-state slots
+  (`mount_sw_ls_out_ptr`, `_out_cap`, `_out_count_ptr`,
+  `_written`) consulted by `snapshot_wire_list_cb` each step.
+  Single-writer non-reentrant per mount.pdxfs's short-lived
+  single-threaded tool shape (two concurrent `--snapshot-list`
+  passes are structurally impossible from a single `_start`).
+
+### Changed
+
+- **`src/snapshot_wire.pdx`** —
+  `SnapshotWire::snapshot_wire_list` adapted to the new walker
+  shape. Public 5-arg signature `(volume_cap_slot,
+  snap_head_lba, out_ptr, out_cap, out_count_ptr) -> u64` is
+  PRESERVED verbatim so `src/main.pdx`'s existing call site at
+  `mount_main_m6_snap_list` compiles byte-for-byte unchanged.
+  Internally the body now (1) stages the three collector-context
+  args into `.bss`, (2) zeroes `mount_sw_ls_written`, (3) calls
+  `snap_chain_walk(snap_head_lba, &snapshot_wire_list_cb, 0)`
+  (cb_ctx is 0 because every piece of state the cb needs lives
+  in `.bss`), (4) discriminates walker return via `rax <= 128 ->
+  count`, `rax > 128 -> error`, writing `*out_count_ptr` on
+  success if the pointer is non-NULL and returning `SW_OK` or
+  `SW_ERR_KERNEL_NOT_IMPL` accordingly. Four callee-save pushes
+  (rbx/r12/r13/r14) atop paideia-as's auto `push rbp` keep
+  `rsp % 16 == 0` at the inner `call snap_chain_walk`.
+- **`src/snapshot_wire.pdx`** — module header updated:
+  "KERNEL GAP #B" marked PARTIALLY RESOLVED (walker body landed
+  at libpdx-volume v1.1.7; block-cache shim is the new blocker,
+  tracked in `src/bc_read_stub.pdx`). Upstream pin bumped from
+  libpdx-volume v1.1.0 to v1.1.7.
+
+### Encoder-pitfall discipline
+
+- Byte-offset multiply uses `shl r10, 5` (not 2-op `imul r,imm`,
+  which the encoder refuses). Same idiom as
+  `libpdx-elevate/elevate_client_policy.pdx` lines 218/287/395.
+- Walk-return discrimination stages 128 via `mov r10, 128; cmp
+  rax, r10` (imm8 128 would sign-extend to -128; same guard
+  shape as the walker's own cap gate).
+- No `test` (every zero-check is `cmp reg, 0`); no `add
+  reg,[mem]`; no multiline `pub let =`; no 2-op `imul`. Labels
+  prefixed `mount_sw_ls_` / `mount_sw_lscb_` (avoids reserved
+  `loop` / `if` / `let`).
+
+---
+
 ## 1.1.3 — 2026-09-02 (ENH-030: libpdx-argv adoption — replaces handwritten scanner)
 
 **Patch bump — no observable behaviour change for well-formed input;
