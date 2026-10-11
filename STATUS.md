@@ -405,7 +405,19 @@ Ticket map for this repo's remaining work:
    `KIND_PDXFS_MOUNT_TABLE` row-append/remove cap +
    `KIND_ELEVATE_CHANNEL` broker-endpoint cap at exec time.  Closes
    the "no broker-endpoint cap provisioned" blocker both M3-001 and
-   M6-002 cite.
+   M6-002 cite. **Convention landed as design doc at paideia-os
+   `design/pdxfs/init-caps-seed-convention.md` (PFS-02, 2026-10-11)**
+   — slot 4 = `KIND_PDXFS_MOUNT_TABLE` (0x1A5) with
+   `R_PMT_INVOKE|R_PMT_WRITE` (0x00A); slot 5 =
+   `KIND_IPC_ENDPOINT` (0x005) to `ELEVATE_BROKER_ENDPOINT_ID = 16`
+   with `R_IPC_INVOKE|R_IPC_WRITE` (0x00A).  Cap seed from PID 1
+   `_init_caps` per `design/pdxfs/init-caps-seed-convention.md` is
+   the authority root; kernel enablement (grow `KIND_SEEDABLE_TABLE`
+   by two entries, singleton-row mint path, broker-endpoint
+   seed-time gate) is stubbed in §6 of the doc and tracked as the
+   PFS-02 kernel-side follow-up.  `src/mint_wire.pdx`'s
+   `mount_mw_elevate_slot = 0` placeholder resolves to literal slot
+   5 once the follow-up lands.
 
 The `KIND_VOLUME` op-catalog gap flagged in `caps.decl` (no
 `VOL_OP_MOUNT` ordinal) and the missing `cap_check_kind` primitive
