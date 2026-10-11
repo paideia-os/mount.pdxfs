@@ -56,27 +56,39 @@
 // which is >> 8 unsigned.
 //
 // ==========================================================================
-// Dev-path construction (stop-gap until PFS-11 lands the real
-// VOL_OP_QUERY_DEVICE_SLOT wire-through)
+// Dev-path construction (PFS-11: real VOL_OP_QUERY_DEVICE_SLOT
+// wire-through; the PFS-10 `& 0xF` modulo-16 stop-gap is RETIRED)
 // ==========================================================================
 //
 // §2.8 of the frozen ABI defines the dev_path syntactic shape for
 // backend_id = 5 (pdxfs_block):
 //
 //   /dev/pdxvol<H>    12 bytes, H = one hex digit '0'..'9' | 'a'..'f'
-//                     encoding a volume-registry row_id in [0..16).
+//                     encoding the volume's backing device slot in
+//                     [0..16).
 //
-// At PFS-10 the client's `<volume-cap>` positional (e.g. "cap:volume:0x4")
-// is parsed by VolumeCap::volume_cap_parse_slot into a cap-slot number;
-// here we take `narrowed_volume_slot & 0xF` as the row_id, format it as
-// a single hex digit, and splice it into the fixed 11-byte "/dev/pdxvol"
-// prefix. This is the mapping PFS-10 adopts; PFS-11 will replace it with
-// a real VOL_OP_QUERY_DEVICE_SLOT cap-invoke that resolves the slot to a
-// device_slot without the modulo-16 narrowing. Volumes whose cap slot
-// lands outside [0..16) today will collide on their low nibble — the
-// SYS_MOUNT_ENODEV return band already covers that failure case
-// end-to-end, so the collision surfaces as a clean kernel refusal rather
-// than a mis-mount.
+// PFS-11 (paideia-os#2578) closes the PFS-10 stop-gap: instead of
+// `narrowed_volume_slot & 0xF` (a naive modulo-16 on the user-space
+// cap-table SLOT number -- not the backing device_slot the frozen ABI
+// semantically encodes, see design/pdxfs/sys-mount-abi.md §2.8),
+// `mount_op_invoke` now issues `cap_invoke(narrowed_volume_slot,
+// VOL_OP_QUERY_DEVICE_SLOT = 0)` via `VolumeDeviceSlot::volume_device_
+// slot_query` (src/volume_device_slot.pdx) to resolve the real backing
+// device_slot kernel-side (`volume_row_device_slot` returns header bits
+// [39:24], a 16-bit field). That device_slot is what gets spliced in as
+// the hex nibble. A refusal from the resolver (one of the four VDS_ERR_*
+// sentinels, all sitting far above 0xFFFF) surfaces as `MOUNT_OP_ERR_
+// RESOLVER` through this file's own return-code vocabulary, distinct
+// from a sys_mount kernel-side refusal, so main.pdx can emit a dedicated
+// result_code (MR_RESULT_DEV_RESOLVER_FAILED, 23).
+//
+// `mount_op_build_dev_path` keeps its `& 0xF` operation on the input,
+// but the input is now the already-16-bit-bounded device_slot answer,
+// not a cap-table slot: a device_slot outside [0..16) is a kernel-side
+// invariant violation (`_volume_table` is 16 rows tops; a mint lands
+// device_slot = row_id in that same range), not a user-space nibble
+// collision. The `& 0xF` is now defence-in-depth, not a semantic
+// narrowing.
 //
 // ==========================================================================
 // Encoder-pitfall discipline
@@ -98,8 +110,14 @@
 module MountOp = structure {
 
   // --- mount_op_invoke status codes. -------------------------------------
-  pub let MOUNT_OP_OK         : u64 = 0
-  pub let MOUNT_OP_ERR_KERNEL : u64 = 1
+  pub let MOUNT_OP_OK           : u64 = 0
+  pub let MOUNT_OP_ERR_KERNEL   : u64 = 1
+  // PFS-11 (#2578): VolumeDeviceSlot::volume_device_slot_query returned
+  // a VDS_ERR_* sentinel (R_VOL_INVOKE missing, dead row, bad handle,
+  // or the kind's op surface disallowed op 0). Distinct from a
+  // MOUNT_OP_ERR_KERNEL because sys_mount was never issued -- the
+  // caller cannot read a raw errno for this class of refusal.
+  pub let MOUNT_OP_ERR_RESOLVER : u64 = 2
 
   // --- SC+ syscall IDs used directly by this file. -----------------------
   pub let MOUNT_OP_SC_MOUNT      : u64 = 75   // sys_mount (dispatch.pdx L738-739)
@@ -190,25 +208,29 @@ module MountOp = structure {
     }
 
   // ==========================================================================
-  // mount_op_build_dev_path(narrowed_volume_slot) -> ()
+  // mount_op_build_dev_path(device_slot) -> ()
   //
   // Splices the fixed 11-byte "/dev/pdxvol" prefix into the 12-byte .bss
   // scratch and writes a single hex digit at [11] derived from
-  // narrowed_volume_slot & 0xF.
+  // device_slot & 0xF.
   //
-  //   rdi = narrowed_volume_slot
+  //   rdi = device_slot  (the kernel-side volume's backing device slot,
+  //                       resolved by VolumeDeviceSlot::volume_device_
+  //                       slot_query; see §Dev-path construction header
+  //                       for why `& 0xF` is defence-in-depth now, not
+  //                       a semantic narrowing)
   //
   // Pure leaf. Register plan (all SysV caller-save):
-  //   rdi    = narrowed_volume_slot (held across the prefix copy loop)
+  //   rdi    = device_slot (held across the prefix copy loop)
   //   rax,rcx = per-byte scratch
   //   r10     = &mount_op_dev_prefix     (prefix source)
   //   r11     = &mount_op_dev_path_scratch (destination)
   //   r9      = cursor (0..11)
   // ==========================================================================
   pub let mount_op_build_dev_path : (u64) -> () !{mem} @{} =
-    fn (narrowed_volume_slot: u64) -> unsafe {
+    fn (device_slot: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "PFS-10 (paideia-os#2577): mount_op_build_dev_path. Splice /dev/pdxvol prefix (11 bytes from mount_op_dev_prefix) into mount_op_dev_path_scratch[0..11], then compute hex digit = (narrowed_volume_slot & 0xF) formatted as ASCII at scratch[11]. Pure leaf -- rax/rcx/rdi/r9/r10/r11 all SysV caller-save, no push/pop. Phase 1 (mount_op_bdp_copy): r9 walks 0..11, loading mount_op_dev_prefix[r9] into al (via `mov_b` into zeroed rax) and storing al into mount_op_dev_path_scratch[r9] with `mov [r11 + r9], al`. Phase 2: `mov rax, rdi; and rax, 0xF`; `cmp rax, 10; jl mount_op_bdp_digit`; `add rax, 0x57` (base 'a' - 10 = 0x61 - 10); `jmp mount_op_bdp_store`. mount_op_bdp_digit: `add rax, 0x30`. mount_op_bdp_store: `mov [r11 + 11], al`. No `add reg,[mem]` (every add operates on registers or an immediate). No `test`. No `imul`. Labels prefixed mount_op_bdp_.",
+      justification: "PFS-10 (paideia-os#2577) + PFS-11 (paideia-os#2578): mount_op_build_dev_path. Splice /dev/pdxvol prefix (11 bytes from mount_op_dev_prefix) into mount_op_dev_path_scratch[0..11], then compute hex digit = (device_slot & 0xF) formatted as ASCII at scratch[11]. PFS-11 (#2578) swaps the semantic input: was a cap-table SLOT narrowed to 4 bits (collision-prone), now the kernel-resolved DEVICE_SLOT from VOL_OP_QUERY_DEVICE_SLOT (16-bit, already in [0..16) by _volume_table invariant). The `& 0xF` stays as defence-in-depth. Pure leaf -- rax/rcx/rdi/r9/r10/r11 all SysV caller-save, no push/pop. Phase 1 (mount_op_bdp_copy): r9 walks 0..11, loading mount_op_dev_prefix[r9] into al (via `mov_b` into zeroed rax) and storing al into mount_op_dev_path_scratch[r9] with `mov [r11 + r9], al`. Phase 2: `mov rax, rdi; and rax, 0xF`; `cmp rax, 10; jl mount_op_bdp_digit`; `add rax, 0x57` (base 'a' - 10 = 0x61 - 10); `jmp mount_op_bdp_store`. mount_op_bdp_digit: `add rax, 0x30`. mount_op_bdp_store: `mov [r11 + 11], al`. No `add reg,[mem]` (every add operates on registers or an immediate). No `test`. No `imul`. Labels prefixed mount_op_bdp_.",
       block: {
         lea r10, [rip + mount_op_dev_prefix];
         lea r11, [rip + mount_op_dev_path_scratch];
@@ -318,7 +340,7 @@ module MountOp = structure {
   pub let mount_op_invoke : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
     fn (narrowed_volume_slot: u64) (mount_point_ptr: u64) (flags: u64) (out_mount_id_ptr: u64) (out_raw_errno_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs, cap},
-      justification: "mount.pdxfs.M2-002 (#5) + M3-004 (#10) + PFS-10 (paideia-os#2577): mount_op_invoke entry point. SysV callee-save discipline: push rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any of them -- popped in reverse order immediately before every return. rbx=narrowed_volume_slot, r12=mount_point_ptr, r13=flags, r14=out_mount_id_ptr, r15=out_raw_errno_ptr; all survive the nested calls (mount_op_build_dev_path, mount_op_strlen_bounded, mount_op_append_row) and every `syscall` per amd64 fast-syscall callee-save convention (SYSCALL preserves callee-save registers; #743 info-leak hardening zeroes caller-save registers only, which is why r15 is staged out of the caller-save r8 it arrived in). Gate: `mov rax, r13; and rax, 0x8 (MOUNT_OP_FLAG_DRY_RUN); cmp rax, 0; jne mount_op_dry_run`. Dry-run arm: `xor rax,rax; mov [r14],rax; mov [r15],rax; xor rax,rax (MOUNT_OP_OK); jmp epilogue`. Real-mount arm (PFS-10): (1) `mov rdi, rbx; call mount_op_build_dev_path` splices /dev/pdxvol<H> into mount_op_dev_path_scratch via the frozen ABI's §2.8 mapping. (2) `mov rdi, r12; call mount_op_strlen_bounded` -> rax = mount_point_len (0..256), stashed into r10 for the syscall. (3) Issue `lea rdi, [rip+mount_op_dev_path_scratch]; mov rsi, 12 (MOUNT_OP_DEV_PATH_LEN); mov rdx, r12 (mount_point_va); mov r10, rax (mount_point_len); mov r8, 5 (MOUNT_OP_BACKEND_PDXFS_BLOCK); mov rax, 75 (MOUNT_OP_SC_MOUNT); syscall` -- standard Linux SYSCALL arg convention per entry.pdx L17-22, which the kernel shuffles into SysV before reaching dispatch_mount. (4) Classify return via MOUNT_MAX=8: `mov r11, 8; cmp rax, r11; jae mount_op_kernel_error` -- rax still holds the raw return at mount_op_kernel_error. (5) Success (rax < 8): `xor r10,r10; mov [r15],r10` (raw_errno=0); `mov r13, rax` (mount_id stashed in r13 since flags is dead); `mov rdi, r13; call mount_op_append_row` (result discarded per that function's own header; the PFS-10 kernel-side APPEND_ROW stub returns 0 on R_PMT_WRITE held, INVOKE_* otherwise); `mov [r14], r13` (write mount_id); `xor rax,rax` (MOUNT_OP_OK); jmp epilogue. mount_op_kernel_error: FIRST `mov [r15], rax` (capture raw errno before rax is clobbered); `xor r10,r10; mov [r14], r10` (mount_id=0); `mov rax, 1` (MOUNT_OP_ERR_KERNEL). Epilogue pops r15/r14/r13/r12/rbx reverse-order then returns. No `add reg,[mem]` anywhere; no `test`; no `imul`. Labels prefixed mount_op_.",
+      justification: "mount.pdxfs.M2-002 (#5) + M3-004 (#10) + PFS-10 (paideia-os#2577) + PFS-11 (paideia-os#2578): mount_op_invoke entry point. SysV callee-save discipline: push rbx/r12/r13/r14/r15 (5 registers, 40 bytes) before repurposing any of them -- popped in reverse order immediately before every return. rbx=narrowed_volume_slot, r12=mount_point_ptr, r13=flags, r14=out_mount_id_ptr, r15=out_raw_errno_ptr; all survive the nested calls (volume_device_slot_query, mount_op_build_dev_path, mount_op_strlen_bounded, mount_op_append_row) and every `syscall` per amd64 fast-syscall callee-save convention (SYSCALL preserves callee-save registers; #743 info-leak hardening zeroes caller-save registers only, which is why r15 is staged out of the caller-save r8 it arrived in). Gate: `mov rax, r13; and rax, 0x8 (MOUNT_OP_FLAG_DRY_RUN); cmp rax, 0; jne mount_op_dry_run`. Dry-run arm: `xor rax,rax; mov [r14],rax; mov [r15],rax; xor rax,rax (MOUNT_OP_OK); jmp epilogue`. Real-mount arm: (0) PFS-11 (#2578) NEW: `mov rdi, rbx; call volume_device_slot_query` resolves the user-space KIND_VOLUME cap-slot to the kernel-side volume's backing device_slot via cap_invoke(VOL_OP_QUERY_DEVICE_SLOT); refusal (rax >= VDS_SLOT_MAX = 0x10000) -> `xor r10,r10; mov [r14],r10; mov [r15],r10; mov rax, 2 (MOUNT_OP_ERR_RESOLVER); jmp epilogue`. Live answer: device_slot in rax. (1) `mov rdi, rax; call mount_op_build_dev_path` splices /dev/pdxvol<H> into mount_op_dev_path_scratch via the frozen ABI's §2.8 mapping -- H is now the RESOLVED device_slot nibble, not a modulo-16 of the cap-table slot. (2) `mov rdi, r12; call mount_op_strlen_bounded` -> rax = mount_point_len (0..256), stashed into r10 for the syscall. (3) Issue `lea rdi, [rip+mount_op_dev_path_scratch]; mov rsi, 12 (MOUNT_OP_DEV_PATH_LEN); mov rdx, r12 (mount_point_va); mov r10, rax (mount_point_len); mov r8, 5 (MOUNT_OP_BACKEND_PDXFS_BLOCK); mov rax, 75 (MOUNT_OP_SC_MOUNT); syscall` -- standard Linux SYSCALL arg convention per entry.pdx L17-22, which the kernel shuffles into SysV before reaching dispatch_mount. (4) Classify return via MOUNT_MAX=8: `mov r11, 8; cmp rax, r11; jae mount_op_kernel_error` -- rax still holds the raw return at mount_op_kernel_error. (5) Success (rax < 8): `xor r10,r10; mov [r15],r10` (raw_errno=0); `mov r13, rax` (mount_id stashed in r13 since flags is dead); `mov rdi, r13; call mount_op_append_row` (result discarded per that function's own header; the PFS-10 kernel-side APPEND_ROW stub returns 0 on R_PMT_WRITE held, INVOKE_* otherwise); `mov [r14], r13` (write mount_id); `xor rax,rax` (MOUNT_OP_OK); jmp epilogue. mount_op_kernel_error: FIRST `mov [r15], rax` (capture raw errno before rax is clobbered); `xor r10,r10; mov [r14], r10` (mount_id=0); `mov rax, 1` (MOUNT_OP_ERR_KERNEL). Epilogue pops r15/r14/r13/r12/rbx reverse-order then returns. No `add reg,[mem]` anywhere; no `test`; no `imul`. VDS_SLOT_MAX (0x10000) is cmp-imm32-legal; staged via r10 to keep the pattern uniform with the kernel's own staging discipline. Labels prefixed mount_op_.",
       block: {
         push rbx;
         push r12;
@@ -339,11 +361,22 @@ module MountOp = structure {
         jne mount_op_dry_run;
 
         // ==================================================================
-        // Real path (PFS-10): frozen path-based sys_mount ABI.
+        // Real path (PFS-10 + PFS-11): frozen path-based sys_mount ABI, with
+        // the real VOL_OP_QUERY_DEVICE_SLOT resolver wiring the dev_path
+        // digit (PFS-10's stop-gap `& 0xF` on the cap-table slot is retired).
         // ==================================================================
 
-        // ---- Step 1: build /dev/pdxvol<H> into mount_op_dev_path_scratch.
+        // ---- Step 0 (PFS-11, #2578): resolve device_slot via cap_invoke.
         mov rdi, rbx;
+        call volume_device_slot_query;
+        mov r10, 0x10000;                    // VDS_SLOT_MAX
+        cmp rax, r10;
+        jae mount_op_resolver_error;
+
+        // ---- Step 1: build /dev/pdxvol<H> into mount_op_dev_path_scratch.
+        //       rdi = resolved device_slot (still in rax from the resolver
+        //       call; move explicitly for clarity, not strictly required).
+        mov rdi, rax;
         call mount_op_build_dev_path;
 
         // ---- Step 2: compute mount_point_len via bounded strlen. -----------
@@ -394,6 +427,17 @@ module MountOp = structure {
         xor r10, r10;
         mov [r14 + 0], r10;                  // *out_mount_id_ptr = 0
         mov rax, 1;                          // MOUNT_OP_ERR_KERNEL
+        jmp mount_op_done;
+
+      mount_op_resolver_error:
+        // PFS-11 (#2578): VolumeDeviceSlot::volume_device_slot_query
+        // refused -- VDS_ERR_* sentinel in rax. sys_mount was NEVER
+        // issued, so there is no kernel-side raw errno; zero both out
+        // params and surface the distinct MOUNT_OP_ERR_RESOLVER return.
+        xor r10, r10;
+        mov [r14 + 0], r10;                  // *out_mount_id_ptr = 0
+        mov [r15 + 0], r10;                  // *out_raw_errno_ptr = 0 (no syscall)
+        mov rax, 2;                          // MOUNT_OP_ERR_RESOLVER
 
       mount_op_done:
         pop r15;

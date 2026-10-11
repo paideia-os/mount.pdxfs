@@ -13,7 +13,7 @@
 # for the call sites each declared kind below backs.
 
 !KIND_USER                0x001   # invoker attribution (audit + elevate identity)
-!KIND_VOLUME              0x003   # READ + INVOKE (mount narrow: volume_cap_resolve -> vol_kind_narrow)
+!KIND_VOLUME              0x008   # R_VOL_INVOKE (QUERY_* ops: volume_cap_resolve -> vol_kind_narrow, PFS-11 VOL_OP_QUERY_DEVICE_SLOT -> volume_device_slot_query)
 !KIND_PDXFS_MOUNT_TABLE   0x004   # APPEND_ROW after a successful mount (mount_op.pdx)
  KIND_IPC_ENDPOINT        0x001   # semantic-pipe stdout (pipe_wire.pdx; svc.schema-registry not yet live, deferred)
 
@@ -53,9 +53,15 @@
 #
 # - The KIND_VOLUME op-catalog gap (no dedicated `VOL_OP_MOUNT`
 #   ordinal, only `VOL_OP_QUERY_*` + `VOL_OP_DEBUG_PRINT`) does not
-#   affect this exec-time narrow: the decl reserves the rights band
-#   (0x003 = READ | INVOKE); the kind's op catalog can grow without a
-#   decl change (design/user/fs-tools-caps.md §2.2, §5).
+#   affect this exec-time narrow: the decl reserves exactly the
+#   right needed for the QUERY_* surface (0x008 = R_VOL_INVOKE); the
+#   kind's op catalog can grow without a decl change
+#   (design/user/fs-tools-caps.md §2.2, §5). PFS-11 (paideia-os#2578)
+#   corrected the earlier `0x003` typo in the hex field (the comment
+#   said "READ + INVOKE" but 0x003 is R_VOL_READ|R_VOL_WRITE per
+#   src/kernel/core/cap/kind_volume.pdx; the real need is R_VOL_INVOKE
+#   alone, matching what sys_volume_mint actually grants and what the
+#   kernel-side `cap_handler_volume` gates every QUERY_* op on).
 #
 # - M6 landing (STATUS.md, CHANGELOG.md 1.1.0/1.1.1) added six wire
 #   modules (dep_graph_wire, lpv_errors_wire, mint_wire,

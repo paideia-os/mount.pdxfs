@@ -180,6 +180,20 @@ module MountRecord = structure {
   //     system-tier call until KIND_ELEVATE_CHANNEL cap-seeding lands).
   pub let MR_RESULT_MINT_FAILED         : u64 = 22
 
+  // --- mount.pdxfs.PFS-11 (paideia-os#2578, v1.1.6) addition.
+  //     VolumeDeviceSlot::volume_device_slot_query refused during
+  //     either mount_op_invoke (user-tier dev_path construction) or
+  //     the /system-tier elevate-mint arm. Distinct from NO_ELEVATE
+  //     (16, elevate cap missing BEFORE the resolver), NARROW_FAILED
+  //     (7, legacy user-tier volume_cap_resolve narrow refusal), and
+  //     MINT_FAILED (22, library returned non-zero after resolver +
+  //     refuse-gate cleared) -- this new code specifically names the
+  //     cap_invoke(VOL_OP_QUERY_DEVICE_SLOT) refusal (INVOKE_DENIED,
+  //     INVOKE_UNSUPPORTED, INVOKE_RESULT_INVALID_HANDLE, or
+  //     VOL_DECODE_BAD). The emit happens BEFORE sys_mount, so there
+  //     is no kernel errno to pair with it.
+  pub let MR_RESULT_DEV_RESOLVER_FAILED : u64 = 23
+
   pub let mr_lit_result_code     : [u8; 16] = ", result_code: \0"
   pub let mr_lit_result_code_len : u64 = 15
 
@@ -256,6 +270,11 @@ module MountRecord = structure {
   // --- M6-002 (#22 wire-through v1.1.1) MINT_FAILED literal. ------------
   pub let mr_lit_result_mint_failed     : [u8; 12] = "MINT_FAILED\0"
   pub let mr_lit_result_mint_failed_len : u64 = 11
+
+  // --- PFS-11 (#2578, v1.1.6) DEV_RESOLVER_FAILED literal.
+  //     Length verified: len("DEV_RESOLVER_FAILED") == 19.
+  pub let mr_lit_result_dev_resolver     : [u8; 20] = "DEV_RESOLVER_FAILED\0"
+  pub let mr_lit_result_dev_resolver_len : u64 = 19
 
   pub let mr_lit_mount_id     : [u8; 13] = ", mount_id: \0"
   pub let mr_lit_mount_id_len : u64 = 12
@@ -686,6 +705,8 @@ module MountRecord = structure {
         je mount_mr_er_lit_dep_notimpl;
         cmp r14, 22;                        // MR_RESULT_MINT_FAILED (M6-002 #22 v1.1.1)
         je mount_mr_er_lit_mint_failed;
+        cmp r14, 23;                        // MR_RESULT_DEV_RESOLVER_FAILED (PFS-11 #2578 v1.1.6)
+        je mount_mr_er_lit_dev_resolver;
         jmp mount_mr_er_lit_kernel_error;   // MR_RESULT_KERNEL_ERROR (3) or unrecognised
 
       mount_mr_er_lit_dry_run:
@@ -796,6 +817,11 @@ module MountRecord = structure {
       mount_mr_er_lit_mint_failed:
         lea rsi, [rip + mr_lit_result_mint_failed];
         mov rdx, 11;                        // mr_lit_result_mint_failed_len
+        jmp mount_mr_er_lit_write;
+
+      mount_mr_er_lit_dev_resolver:
+        lea rsi, [rip + mr_lit_result_dev_resolver];
+        mov rdx, 19;                        // mr_lit_result_dev_resolver_len
         jmp mount_mr_er_lit_write;
 
       mount_mr_er_lit_kernel_error:

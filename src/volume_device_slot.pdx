@@ -1,0 +1,211 @@
+// src/volume_device_slot.pdx — mount.pdxfs.PFS-11 (paideia-os#2578):
+// real VOL_OP_QUERY_DEVICE_SLOT wire-through for both the mount-op
+// dev_path construction AND the elevate-mint dev_cap argument.
+//
+// ======================================================================
+// Context
+// ======================================================================
+//
+// PFS-10 (mount.pdxfs v1.1.5) left TWO documented stop-gaps that this
+// file closes:
+//
+//   STOP-GAP A (dev_path digit, src/mount_op.pdx):
+//     `narrowed_volume_slot & 0xF` as the hex nibble spliced into
+//     `/dev/pdxvol<H>`. A naive modulo-16 on a USER-SPACE cap-table
+//     SLOT number -- not the backing device slot that the frozen ABI's
+//     dev-path shim semantically encodes
+//     (design/pdxfs/sys-mount-abi.md §2.8 is explicit: "PFS-11 lands
+//     the real `VOL_OP_QUERY_DEVICE_SLOT` wire-through that builds
+//     this string from the volume cap handle"). Two cap slots whose
+//     low nibbles collide would both end up at the same dev_path even
+//     if they back different kernel-side volume rows -- the current
+//     SYS_MOUNT_ENODEV refuse covers the mis-mount case but any
+//     adjacent operator diagnostics (`stat /dev/pdxvol4` audit-log
+//     entries, etc.) would mis-attribute.
+//
+//   STOP-GAP B (dev_cap=0 fed to `MintWire::mint_wire_invoke`,
+//               src/main.pdx line 340 and src/mint_wire.pdx header):
+//     The /system-tier elevate-mint arm passes `xor rdi, rdi`
+//     unconditionally for the KIND_BLKDEV `dev_cap` arg because the
+//     M6-002 landing had no way to resolve a user-space KIND_VOLUME
+//     cap-slot to its backing block-device cap. v1.1.1 flagged this
+//     as "safe today because mint_wire_invoke's refuse-gate fires on
+//     every reachable input before dev_cap is dereferenced", but the
+//     day `mount_mw_elevate_slot` gets a real seed and the gate stops
+//     firing, every /system mount would hit a null `dev_cap` inside
+//     `vol_kind_mint_elevate` and fail opaquely.
+//
+// Both stop-gaps have the SAME root cause: no user-space resolver from
+// a KIND_VOLUME cap-slot to the volume's backing device slot
+// (= KIND_BLKDEV cap-slot per kernel kind_blkdev.pdx's unified family
+// dispatch, where the kernel-side `volume_row_device_slot` returns
+// header bits [39:24] = bdev_cap).
+//
+// Both stop-gaps have the SAME fix: `VOL_OP_QUERY_DEVICE_SLOT` (op
+// ordinal 0), already landed kernel-side in `kind_volume.pdx`
+// (R52.M5-001) as the first entry of the `cap_handler_volume`
+// op-dispatcher's `vol_hn_device_slot` arm. The op routes through
+// `volume_row_device_slot`, requires `R_VOL_INVOKE` (0x008), and
+// returns the live-row device_slot in rax (or `VOL_DECODE_BAD` /
+// `INVOKE_DENIED` / `INVOKE_UNSUPPORTED` on refusal).
+//
+// ======================================================================
+// Why this is Path B (extend the KIND_VOLUME op surface) and not
+// Path A (KIND_BLOCK_DEVICE `BD_OP_QUERY_SLOT`)
+// ======================================================================
+//
+// PFS-11's scope allowed EITHER a `KIND_BLOCK_DEVICE` resolver on the
+// backing device cap OR a `VOL_OP_QUERY_DEVICE_SLOT` op on the volume
+// cap. A grep (2026-10-11) of the paideia-os kernel finds BOTH kinds
+// landed: `KIND_BLKDEV` (0x42) with its unified family dispatcher in
+// `cap_handler_blkdev.pdx` + `BDEV_OP_QUERY_FAMILY` /
+// `BDEV_OP_QUERY_GEOM` / etc., AND `KIND_VOLUME` (0x1A0) with
+// `VOL_OP_QUERY_DEVICE_SLOT` already defined. The direction of the
+// resolution we need -- "I hold a volume cap; what's its backing block
+// device?" -- is NATURALLY expressed on the volume cap: the volume
+// knows its device_slot, the device does not know every volume that
+// backs onto it. Attempting Path A would need the user to ALREADY
+// hold a KIND_BLKDEV cap in the first place (and then query which
+// volume uses it, inversely -- a one-to-many lookup kernel-side).
+// Path B's semantics are the forward direction and already landed.
+//
+// This file therefore wires Path B. No kernel-side extension is
+// needed; `VOL_OP_QUERY_DEVICE_SLOT` is already op 0 in
+// `kind_volume.pdx`'s `cap_handler_volume` dispatcher.
+//
+// ======================================================================
+// Return taxonomy
+// ======================================================================
+//
+// `volume_device_slot_query` surfaces TWO classes of refusal distinct
+// from a successful device_slot read:
+//
+//   VDS_OK (= device_slot in [0..65536)) -- any u64 whose high 48 bits
+//     are zero. The real-world dense range today is [0..16) per
+//     `_volume_table`'s 16-row cap (`kind_volume.pdx` line 220); nothing
+//     in this file enforces a tighter bound because `kind_volume.pdx`
+//     itself does not -- the kernel's `volume_row_device_slot` extracts
+//     bits [39:24] (= 16-bit field) via `mov r10, 0xFFFF; and rax, r10`.
+//     This file returns the kernel's answer verbatim.
+//
+//   VDS_ERR_DECODE   (= 0xFFFFFFFFFFFFFFFF) -- kernel returned
+//     `VOL_DECODE_BAD` (volume row not live, bad target_ptr).
+//
+//   VDS_ERR_INVOKE   (= 0xFFFFFFFFFFFFFFFD) -- kernel returned
+//     `INVOKE_DENIED` (R_VOL_INVOKE not held). Numerically the same
+//     constant `invoke.pdx` exports; recomputed here as a self-
+//     documenting literal rather than a dependency.
+//
+//   VDS_ERR_UNSUP    (= 0xFFFFFFFFFFFFFFFC) -- kernel returned
+//     `INVOKE_UNSUPPORTED` (the volume cap's rights band disallowed
+//     op 0, or `cap_handler_volume` is not wired for this kind).
+//     Should never reach a correctly-provisioned mount.pdxfs today;
+//     reserved for the day a mint helper lands a volume cap whose
+//     narrow dropped R_VOL_INVOKE.
+//
+//   VDS_ERR_HANDLE   (= 0xFFFFFFFFFFFFFFFE) -- kernel returned
+//     `INVOKE_RESULT_INVALID_HANDLE` (slot > 256 or kind-tag zero).
+//
+// A caller distinguishes success from the four-way refusal by a
+// single `cmp rax, 0x10000; jae refuse` -- the real device_slot bound
+// (16-bit, well below 0x10000) separates every live answer from every
+// sentinel (all of which sit above 0xFFFF...FC00).
+//
+// ======================================================================
+// Encoder-pitfall discipline
+// ======================================================================
+//
+// No `add reg, [mem]` anywhere. No `test` mnemonic (every zero-check
+// is `cmp reg, 0`). Reserved-label discipline: every branch label in
+// this file is prefixed `mount_vds_`. No multiline `pub let foo = "..."`.
+// Module basename `volume_device_slot` matches the file name byte-for-
+// byte (recent regression check per the pdx-encoder-pitfalls memory).
+//
+// ======================================================================
+// SC+ IDs used directly by this file
+// ======================================================================
+//
+// SC+ ID 4 (`cap_invoke`) -- the ring-3 syscall ID defined by
+// `src/kernel/core/syscall/dispatch.pdx` L614-L615 and L1371-L1375.
+// Register convention (standard Linux SYSCALL):
+//   rax = 4             SC+ ID
+//   rdi = cap_slot      (first SysV arg, which `dispatch_cap_invoke`
+//                        shuffles into cap_invoke's rdi)
+//   rsi = op_arg        (second SysV arg; low 8 bits = op code,
+//                        high 56 bits must be zero per
+//                        `cap_handler_volume`'s `op_arg[63:8] == 0`
+//                        gate, else `VOL_TAIL_BAD_ARG` = 0xFFFFED22)
+// Return in rax: either the live device_slot or one of the sentinels
+// above.
+//
+// Upstream: paideia-os src/kernel/core/cap/kind_volume.pdx
+// (`VOL_OP_QUERY_DEVICE_SLOT = 0`, `cap_handler_volume`'s dispatcher);
+// paideia-os src/kernel/core/cap/invoke.pdx (`INVOKE_DENIED`,
+// `INVOKE_UNSUPPORTED`, `INVOKE_RESULT_INVALID_HANDLE`); paideia-os
+// design/pdxfs/sys-mount-abi.md §2.8 (the wire-through requirement
+// this file closes).
+
+module VolumeDeviceSlot = structure {
+
+  // ============================================================================
+  // Op code (mirrors kernel-side kind_volume.pdx `VOL_OP_QUERY_DEVICE_SLOT`).
+  // ============================================================================
+
+  pub let VDS_OP_QUERY_DEVICE_SLOT : u64 = 0
+
+  // ============================================================================
+  // SC+ ID 4 — `cap_invoke`.
+  // ============================================================================
+
+  pub let VDS_SC_CAP_INVOKE : u64 = 4
+
+  // ============================================================================
+  // Return sentinels. See module header's §"Return taxonomy".
+  // ============================================================================
+
+  pub let VDS_ERR_DECODE : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let VDS_ERR_HANDLE : u64 = 0xFFFFFFFFFFFFFFFE
+  pub let VDS_ERR_INVOKE : u64 = 0xFFFFFFFFFFFFFFFD
+  pub let VDS_ERR_UNSUP  : u64 = 0xFFFFFFFFFFFFFFFC
+
+  // ============================================================================
+  // Upper bound on a valid device_slot answer. Kernel-side
+  // `volume_row_device_slot` masks to 16 bits (`and rax, 0xFFFF`), so a
+  // live answer is in [0..0x10000). Every sentinel sits far above this
+  // bound (the lowest, `VDS_ERR_UNSUP = 0xFFFFFFFFFFFFFFFC`, is well
+  // past 2^48). Callers discriminate with `cmp rax, 0x10000; jae
+  // refuse`.
+  // ============================================================================
+
+  pub let VDS_SLOT_MAX : u64 = 0x10000
+
+  // ==========================================================================
+  // volume_device_slot_query(narrowed_volume_slot) -> u64
+  //     (device_slot in [0..0x10000) on success;
+  //      VDS_ERR_* otherwise -- see module header)
+  //
+  //   rdi = narrowed_volume_slot  (a KIND_VOLUME cap slot, typically
+  //                                 the output of
+  //                                 VolumeCap::volume_cap_resolve)
+  //
+  // Issues cap_invoke(narrowed_volume_slot, op_arg = 0) via SC+ ID 4.
+  // op_arg = 0 encodes VOL_OP_QUERY_DEVICE_SLOT (op code = 0, high
+  // bits zero per `cap_handler_volume`'s op_arg[63:8]==0 gate).
+  //
+  // Pure leaf at the syscall boundary. rax/rdi/rsi are all SysV
+  // caller-save; the SYSCALL preserves callee-save registers per the
+  // amd64 fast-syscall convention, so no push/pop needed. No branch
+  // (the kernel's own return value IS the function's return).
+  // ==========================================================================
+  pub let volume_device_slot_query : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (narrowed_volume_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "mount.pdxfs.PFS-11 (paideia-os#2578): volume_device_slot_query entry point. Issues `mov rsi, 0 (VDS_OP_QUERY_DEVICE_SLOT = op code 0, high bits zero so op_arg[63:8]==0 passes kernel's VOL_TAIL_BAD_ARG gate); mov rax, 4 (VDS_SC_CAP_INVOKE); syscall`. rdi arrives holding narrowed_volume_slot (first SysV arg); `dispatch_cap_invoke` shuffles rsi->rdi (slot) and rdx->rsi (op_arg), so our rdi (slot) must stay in rdi and our rsi (op_arg) must stay in rsi -- which is already the Linux SYSCALL convention this file follows. Kernel's `cap_handler_volume` dispatches op=0 to `volume_row_device_slot`, requires R_VOL_INVOKE (0x008) on the cap descriptor's rights band; refusal returns INVOKE_DENIED (0xFFFFFFFFFFFFFFFD). Live row returns device_slot in [0..0x10000) via header bits [39:24] mask. Dead row returns VOL_DECODE_BAD (0xFFFFFFFFFFFFFFFF). Pure leaf -- rax/rdi/rsi all SysV caller-save, no push/pop, no branch (the kernel's return IS our return). No `add reg,[mem]`; no `test`. Labels: none (single straight-line block).",
+      block: {
+        mov rsi, 0;                          // VDS_OP_QUERY_DEVICE_SLOT (op code 0, op_arg[63:8]==0)
+        mov rax, 4;                          // VDS_SC_CAP_INVOKE
+        syscall;
+        ret;
+      }
+    }
+}

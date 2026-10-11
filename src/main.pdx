@@ -309,41 +309,68 @@ module Main = structure {
         je mount_main_volume_resolve;
 
         // ---- MPC_SYSTEM_PATH (1) or MPC_CROSS_USER (2): needs elevate. ----
-        // M6-002 v1.1.1 (#22 wire-through): route through mint_wire_invoke
-        // (src/mint_wire.pdx) instead of the M3-era mount_elev_require_
-        // system stub. mint_wire_invoke composes the tier-driven elevate
-        // selection with the new 3-arg vol_kind_mint_elevate mint form:
-        // when the process holds no KIND_ELEVATE_CHANNEL cap (today's
-        // landing), it refuses BEFORE the library call and returns
-        // MW_ERR_NO_ELEVATE (1) -- surfaced here as MR_RESULT_NO_ELEVATE
-        // (16). On a legal grant, it writes a fresh KIND_VOLUME slot into
-        // mount_narrowed_slot and returns MW_OK; this arm then jumps
-        // directly to mount_main_mount_op, bypassing volume_cap_resolve
-        // (the raw <volume-cap> URI is unused on the elevated path -- the
-        // minted narrowed slot IS the cap that sys_mount consumes).
+        // M6-002 v1.1.1 (#22 wire-through) + PFS-11 (paideia-os#2578):
         //
-        // GAP flagged for main: no KIND_BLOCK_DEVICE resolver exists in
-        // this repo (or upstream) that would map a <volume-cap> URI to
-        // the backing dev_cap vol_kind_mint_elevate expects. Passing
-        // rdi=0 is safe TODAY because the refuse-gate inside mint_wire_
-        // invoke fires on every reachable input (no elevate cap held),
-        // so the dev_cap value is never dereferenced. Once cap-seeding
-        // lands and the refuse-gate stops firing, this call site needs a
-        // real dev_cap upstream helper -- see mint_wire.pdx module
-        // header for the cap-seeding hook that would install the KIND_
-        // ELEVATE_CHANNEL slot, and design/tooling/volume-tooling-ux.md
-        // §4.2 for the KIND_BLOCK_DEVICE resolver contract.
+        // PFS-11 closes the v1.1.1 "no KIND_BLOCK_DEVICE resolver" GAP by
+        // first resolving the user-space <volume-cap> URI through
+        // volume_cap_resolve (same path /home takes), then querying the
+        // resolved slot's backing device_slot via volume_device_slot_
+        // query (src/volume_device_slot.pdx, cap_invoke with VOL_OP_
+        // QUERY_DEVICE_SLOT = 0). The resolved device_slot IS the
+        // KIND_BLKDEV cap that vol_kind_mint_elevate semantically
+        // expects for its dev_cap argument -- the "map a volume to its
+        // block device" direction is naturally expressed on the volume
+        // cap (which knows its device_slot via header bits [39:24] in
+        // _volume_table), not on the device (which has no inverse
+        // index).
+        //
+        // mint_wire_invoke composes the tier-driven elevate selection
+        // with the new 3-arg vol_kind_mint_elevate mint form: when the
+        // process holds no KIND_ELEVATE_CHANNEL cap (today's landing),
+        // it refuses BEFORE the library call and returns MW_ERR_NO_
+        // ELEVATE (1) -- surfaced here as MR_RESULT_NO_ELEVATE (16).
+        // On a legal grant, it writes a fresh KIND_VOLUME slot into
+        // mount_narrowed_slot (replacing the one volume_cap_resolve
+        // wrote above, since mint narrows from the elevated authority
+        // instead of just rights-narrowing the user-provided cap) and
+        // returns MW_OK; this arm then jumps to mount_main_mount_op.
         //
         // mount_elev_require_system remains defined in src/elevate.pdx
         // as a legacy stub -- its M4-002 test driver still references
-        // it. Its production call site is REMOVED here.
-        xor rdi, rdi;                        // dev_cap = 0 (documented GAP: no KIND_BLOCK_DEVICE resolver)
-        mov rsi, rax;                        // mpc_class from mount_point_class
+        // it. Its production call site stays REMOVED (M6-002 removed
+        // it; PFS-11 keeps the removal).
+        mov r14, rax;                        // r14 = mpc_class (survives three nested calls; r14 has been dead since Phase 2's ParsedArgv-struct loads completed)
+
+        // ---- PFS-11 Step 1: resolve <volume-cap> URI first (was
+        //      skipped at M6-002 since dev_cap was 0). ------------------
+        mov rdi, r15;                        // volume_cap_ptr
+        lea rsi, [rip + mount_narrowed_slot];
+        call volume_cap_resolve;
+
+        cmp rax, 1;                          // VC_ERR_BAD_URI
+        je mount_main_bad_volume_cap;
+        cmp rax, 0;                          // VC_OK
+        jne mount_main_narrow_failed;        // VC_ERR_NARROW_FAILED or any unknown
+
+        // ---- PFS-11 Step 2: query the resolved slot's backing device
+        //      slot via cap_invoke(VOL_OP_QUERY_DEVICE_SLOT). ------------
+        mov rdi, [rip + mount_narrowed_slot];
+        call volume_device_slot_query;
+        mov r10, 0x10000;                    // VDS_SLOT_MAX
+        cmp rax, r10;
+        jae mount_main_resolver_failed;
+
+        // ---- PFS-11 Step 3: feed the resolved device_slot (dev_cap)
+        //      into mint_wire_invoke; narrowed slot destination is the
+        //      same mount_narrowed_slot (mint overwrites it with the
+        //      freshly-minted elevated KIND_VOLUME slot). ---------------
+        mov rdi, rax;                        // dev_cap = resolved device_slot (NOT 0 any more)
+        mov rsi, r14;                        // mpc_class
         lea rdx, [rip + mount_narrowed_slot];
         call mint_wire_invoke;
 
         cmp rax, 0;                          // MW_OK
-        je mount_main_mount_op;              // narrowed slot already in place; skip volume_cap_resolve
+        je mount_main_mount_op;
 
         cmp rax, 1;                          // MW_ERR_NO_ELEVATE
         je mount_main_m22_no_elevate;
@@ -351,6 +378,28 @@ module Main = structure {
         // MW_ERR_LIBPDX_VK (2) or any unrecognised code: mint attempted
         // but the library refused post-gate. Emit MR_RESULT_MINT_FAILED.
         jmp mount_main_m22_mint_failed;
+
+      mount_main_resolver_failed:
+        // PFS-11 (#2578): VolumeDeviceSlot::volume_device_slot_query
+        // refused during the /system-tier elevate-mint arm. The user
+        // holds a volume cap but one of: R_VOL_INVOKE not granted
+        // (INVOKE_DENIED), row dead (VOL_DECODE_BAD), bad handle
+        // (slot > 256 or kind-zero), or op surface disallowed
+        // (INVOKE_UNSUPPORTED). The elevate broker never got called;
+        // emit MR_RESULT_DEV_RESOLVER_FAILED (23) and exit 3.
+        mov rdi, r15;
+        mov rsi, r12;
+        mov rdx, rbx;
+        mov rcx, 23;                         // MR_RESULT_DEV_RESOLVER_FAILED
+        xor r8, r8;                          // mount_id unused
+        call mount_pipe_emit_result;
+
+        mov rdi, r13;                        // audit_id
+        mov rsi, 3;                          // exit_status = 3
+        call mount_audit_commit;
+
+        mov rdi, 3;
+        jmp mount_main_exit;
 
       mount_main_m22_no_elevate:
         // System-tier mount refused because no KIND_ELEVATE_CHANNEL cap
@@ -459,6 +508,14 @@ module Main = structure {
 
         cmp rax, 0;                          // MOUNT_OP_OK
         je mount_main_success;
+
+        // ---- PFS-11 (#2578): MOUNT_OP_ERR_RESOLVER (2) -- the user-tier
+        //      dev_path construction's VOL_OP_QUERY_DEVICE_SLOT refused
+        //      BEFORE sys_mount; mount_raw_errno_out is 0 and classify
+        //      would mis-label the refusal as KERNEL_ERROR. Dispatch
+        //      directly to the resolver-failed emit arm instead. --------
+        cmp rax, 2;                          // MOUNT_OP_ERR_RESOLVER
+        je mount_main_resolver_failed;
 
         // ---- MOUNT_OP_ERR_KERNEL: classify the raw errno (#10). ------------
         mov rdi, [rip + mount_raw_errno_out];

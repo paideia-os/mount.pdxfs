@@ -1,5 +1,142 @@
 # mount.pdxfs — CHANGELOG
 
+## 1.1.6 — 2026-10-11 (PFS-11 / paideia-os#2578: real `VOL_OP_QUERY_DEVICE_SLOT` wire-through + closes `dev_cap=0` for `/system` mounts)
+
+**Patch bump — correctness fix on a path only reachable once
+cap-seeding lands.**  PFS-10 left two documented stop-gaps rooted in
+the same missing user-space resolver (`KIND_VOLUME` cap → backing
+device slot); PFS-11 closes both via a single new helper over the
+already-landed kernel-side `VOL_OP_QUERY_DEVICE_SLOT` (op 0 in
+`cap_handler_volume`, R52.M5-001).
+
+### Added
+
+- **`src/volume_device_slot.pdx`** (NEW, ~210 LOC) —
+  `VolumeDeviceSlot::volume_device_slot_query(narrowed_volume_slot)`
+  issues `cap_invoke(slot, op_arg = 0)` via SC+ ID 4 and returns the
+  resolved device slot or one of four `VDS_ERR_*` sentinels
+  (`VOL_DECODE_BAD` / `INVOKE_RESULT_INVALID_HANDLE` /
+  `INVOKE_DENIED` / `INVOKE_UNSUPPORTED`).  Pure leaf — no push/pop,
+  no branch; the kernel's return value IS the function's return.
+  Return bound: `VDS_SLOT_MAX = 0x10000` separates every live answer
+  (16-bit header field) from every sentinel (above `0xFFFFFFFF...FC`).
+- **`src/mount_record.pdx`** — new `MR_RESULT_DEV_RESOLVER_FAILED =
+  23` + literal `"DEV_RESOLVER_FAILED\0"` + dispatch arm.  Distinct
+  from `MR_RESULT_NO_ELEVATE` (16), `MR_RESULT_NARROW_FAILED` (7),
+  `MR_RESULT_MINT_FAILED` (22) — this new code specifically names
+  the `cap_invoke(VOL_OP_QUERY_DEVICE_SLOT)` refusal (emit happens
+  BEFORE `sys_mount`, so no kernel errno pairs with it).
+
+### Changed
+
+- **`src/mount_op.pdx`** — `mount_op_invoke` real-mount arm now runs
+  `volume_device_slot_query` as Step 0 (BEFORE
+  `mount_op_build_dev_path`); the resolved device slot drives the
+  `/dev/pdxvol<H>` hex digit.  The PFS-10 `narrowed_volume_slot & 0xF`
+  stop-gap is RETIRED; `mount_op_build_dev_path`'s own residual
+  `& 0xF` is now defence-in-depth over an already-16-bit-bounded
+  input, not a semantic narrowing.  New return code
+  `MOUNT_OP_ERR_RESOLVER = 2` surfaces a resolver refusal distinctly
+  from a kernel-side `sys_mount` refusal.
+- **`src/main.pdx`** — `/system`-tier (`MPC_SYSTEM_PATH` /
+  `MPC_CROSS_USER`) arm now:
+    1. Runs `volume_cap_resolve` first (previously skipped —
+       `volume_cap_ptr` was passed through unresolved and the
+       `vol_kind_mint_elevate` call received `rdi = 0` for the
+       `KIND_BLKDEV` dev_cap arg).
+    2. Runs `volume_device_slot_query` on the resolved slot to get
+       the real backing dev_cap.
+    3. Feeds that dev_cap into `mint_wire_invoke` (replaces the
+       v1.1.1 `xor rdi, rdi` stop-gap).
+  On resolver refusal before mint, the new
+  `mount_main_resolver_failed` arm emits
+  `MR_RESULT_DEV_RESOLVER_FAILED`.  `r14` is reused to carry
+  `mpc_class` across the three nested calls — it has been dead since
+  Phase 2's `ParsedArgv`-struct loads completed, and both the M6
+  snap-mount branch (which also reuses it as a struct-base pointer)
+  and this new /system arm are mutually unreachable from each other
+  within one invocation.
+- **`src/main.pdx`** — `mount_op_invoke`'s new `MOUNT_OP_ERR_RESOLVER
+  = 2` return is dispatched BEFORE the raw-errno classify path
+  (otherwise `mount_record_classify_mount_errno(0)` would mis-label
+  the refusal as `KERNEL_ERROR`).
+- **`caps.decl`** — `KIND_VOLUME` rights-mask corrected from `0x003`
+  (= `R_VOL_READ | R_VOL_WRITE`, which contradicted the line's own
+  "READ + INVOKE" comment) to `0x008` (`R_VOL_INVOKE` alone, matching
+  what `cap_handler_volume` actually gates `QUERY_*` ops on and what
+  `sys_volume_mint` grants in its `0x408` production mint rights
+  band).  Pre-existing hex-vs-comment typo flagged by PFS-11's
+  grep; a reconciling loader would have refused this decl with
+  `-EACCES` previously (`parent 0x408 AND decl 0x003 = 0x000`, which
+  is narrower than the decl).
+
+### Behaviour notes
+
+- Dry-run path (`--dry-run`) is unchanged — the dry-run gate still
+  short-circuits before any resolver call.
+- User-tier (`/home/**`, `/mnt/**`, `/tmp/**`) now issues one extra
+  `cap_invoke` per mount (the resolver call).  Kernel-side cost is
+  one op dispatch through `cap_handler_volume` + one
+  `volume_row_device_slot` row read — well under 100 cycles.
+- `/system`-tier still refuses with `MR_RESULT_NO_ELEVATE` end-to-end
+  until the `_init_caps`-style `KIND_ELEVATE_CHANNEL` seed lands,
+  because `mint_wire_invoke`'s refuse-gate still fires on a zero
+  `mount_mw_elevate_slot`.  The PFS-11 change ensures that the day
+  the seed lands, the mint path receives a real `dev_cap` and
+  `vol_kind_mint_elevate` runs correctly — no further mount.pdxfs
+  change needed for the elevate path.
+- `src/elevate.pdx::mount_elev_require_system` is UNCHANGED — the
+  M4-002 test driver still references it, and the "fail-closed on
+  no broker cap" posture it documents remains correct.  Its
+  production call site stays removed (M6-002 removed it).
+
+### Rationale
+
+- **Path choice (Path B over Path A, `kind_volume` extension over a
+  `kind_blkdev` resolver).**  The direction we need — "I hold a
+  volume cap; what's its backing block device?" — is naturally
+  expressed on the volume cap (the volume knows its device_slot via
+  header bits [39:24]; a device would need an inverse index to
+  answer the same question).  `VOL_OP_QUERY_DEVICE_SLOT` was already
+  landed as op 0 in `kind_volume.pdx` — no kernel-side extension
+  needed.
+- **Why a new result code (`23`) rather than overloading
+  `NARROW_FAILED` (`7`).**  `NARROW_FAILED` carries a well-defined
+  meaning: `vol_kind_narrow` refused the user's requested
+  `ops_mask`.  A `VOL_OP_QUERY_DEVICE_SLOT` refusal has a different
+  root cause (`R_VOL_INVOKE` missing on the already-narrowed cap,
+  or the volume row dead) and should carry a distinct name so
+  operators and audit consumers can tell the two refusal classes
+  apart.
+
+### Known gaps carried forward
+
+- Kernel-side `sys_mount` currently decodes `/dev/pdxvol<H>`'s hex
+  digit as a volume registry `row_id`, not as a `device_slot` (see
+  `sys_mount.pdx` step (c)/(e) and `design/pdxfs/sys-mount-abi.md
+  §2.8`).  At today's `_volume_table` size (16 rows) `row_id` and
+  `device_slot` collapse numerically in practice.  A future wave
+  should either rename the kernel-side variable to `device_slot`
+  and route through `volume_registry_lookup_by_device` or expose a
+  parallel `VOL_OP_QUERY_ROW_ID` op.  Out of PFS-11 scope.
+- `_init_caps`-style seeding of `KIND_ELEVATE_CHANNEL` for standalone
+  CLI tools remains the only step between v1.1.6 and a real
+  working `/system` mount end-to-end.  mount.pdxfs itself needs no
+  further change — the mint call now carries a real `dev_cap`.
+
+### Encoder-pitfall discipline
+
+- Module basename `volume_device_slot` matches the file name
+  byte-for-byte (`src/volume_device_slot.pdx` ↔ `module
+  VolumeDeviceSlot`), per the recent regression check in the
+  pdx-encoder-pitfalls memory.
+- No `add reg, [mem]` anywhere.  No `test` mnemonic (every zero-
+  check is `cmp reg, 0`).  No multiline `pub let foo = "..."`.
+- Reserved-label discipline: new labels prefixed `mount_vds_` (none
+  needed — straight-line block), `mount_op_resolver_error`,
+  `mount_main_resolver_failed`.  None collide with any existing
+  symbol in `src/` or `tests/`.
+
 ## 1.1.5 — 2026-10-11 (PFS-10 / paideia-os#2577: adopt frozen path-based `sys_mount` ABI + real `PMT_OP_APPEND_ROW` end-to-end)
 
 **Patch bump — correctness fix on an edge nothing could reach before.**
