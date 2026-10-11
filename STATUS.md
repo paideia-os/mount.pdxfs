@@ -2,12 +2,15 @@
 
 **Wave:** R90-XREPO (post-R53 satellite-cascade + libpdx-volume v1.1)
 **Current milestone:** M6 (libpdx-volume v1.1 API adoption) — **landed**;
-PFS-07 caller adaptation (paideia-os#2574) — **landed** at v1.1.4
-**Version:** 1.1.4 (PFS-07 / paideia-os#2574: adapt
-`snapshot_wire_list` to libpdx-volume v1.1.7's 3-arg
-`snap_chain_walk`; add `BcReadStub::lpv_bc_read` user-space stub
-until the KIND_BLOCK_CACHE kernel shim lands)
-**Version history:** 1.1.3 (ENH-030: libpdx-argv adoption —
+PFS-10 end-to-end `sys_mount` ABI adoption (paideia-os#2577) —
+**landed** at v1.1.5
+**Version:** 1.1.5 (PFS-10 / paideia-os#2577: adopt frozen path-based
+`sys_mount` ABI + real `PMT_OP_APPEND_ROW` end-to-end — closes the
+three "KERNEL GAP #1/#2/#3" bullets `src/mount_op.pdx` carried since
+M2-002)
+**Version history:** 1.1.4 (PFS-07 / paideia-os#2574:
+`snapshot_wire_list` 3-arg `snap_chain_walk` adoption + user-space
+`BcReadStub::lpv_bc_read`), 1.1.3 (ENH-030: libpdx-argv adoption —
 replaces handwritten scanner, #25)
 
 See `design/tooling/volume-tooling-ux.md` §9.2 in the

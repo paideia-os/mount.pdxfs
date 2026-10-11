@@ -1,5 +1,89 @@
 # mount.pdxfs — CHANGELOG
 
+## 1.1.5 — 2026-10-11 (PFS-10 / paideia-os#2577: adopt frozen path-based `sys_mount` ABI + real `PMT_OP_APPEND_ROW` end-to-end)
+
+**Patch bump — correctness fix on an edge nothing could reach before.**
+The pre-existing "KERNEL GAP #1/#2/#3" bullets in `src/mount_op.pdx`
+(dispatch-unwired, two incompatible target ABIs, `PMT_OP_APPEND_ROW`
+unwired) are now CLOSED. `mount_op_invoke` switches from the retracted
+cap-slot shape to the frozen path-based `sys_mount` ABI (sysno 75) per
+`design/pdxfs/sys-mount-abi.md §2.3` in the paideia-os monorepo, and the
+post-success `PMT_OP_APPEND_ROW` cap-invoke now hits a real kernel
+handler arm (requires `R_PMT_WRITE`; stub body returns 0).
+
+### Changed
+
+- **`src/mount_op.pdx`** — `mount_op_invoke` body rewritten to the
+  frozen path-based register layout:
+  - `rax = 75` (sysno `SYS_MOUNT`)
+  - `rdi = dev_path_va` (12-byte `.bss` scratch
+    `mount_op_dev_path_scratch`, spliced from the fixed 11-byte
+    `/dev/pdxvol` prefix plus a single-hex-digit nibble from
+    `narrowed_volume_slot & 0xF`)
+  - `rsi = dev_path_len = 12`
+  - `rdx = mount_point_va` (NUL-terminated argv string, kernel-side
+    shim bounces into a 256-byte scratch)
+  - `r10 = mount_point_len` (via new `mount_op_strlen_bounded`, capped
+    at `MOUNT_OP_MP_LEN_MAX = 256`)
+  - `r8  = backend_id = 5` (`MOUNT_OP_BACKEND_PDXFS_BLOCK`)
+  Return discriminator: `cmp rax, 8` (= `MOUNT_MAX`); `jae
+  mount_op_kernel_error`.
+- **`src/mount_op.pdx`** — new helpers `mount_op_build_dev_path`
+  (splices the 11-byte prefix + hex nibble into the 12-byte scratch)
+  and `mount_op_strlen_bounded` (bounded `strlen` for
+  `mount_point_len`, capped at 256). Both pure leaves; no new runtime
+  allocations.
+- **`src/mount_op.pdx`** — module header retracts GAP #1/#2/#3 bullets
+  and documents the frozen ABI shape + the stop-gap `& 0xF` nibble
+  mapping (PFS-11 will replace it with the real
+  `VOL_OP_QUERY_DEVICE_SLOT` wire-through).
+
+### Behaviour notes
+
+- `mount_op_append_row` is UNCHANGED on the user side; its result is
+  still discarded (best-effort audit edge, mirroring every
+  `audit_emit` call site). What CHANGED is the kernel: before PFS-10
+  the cap-invoke returned `INVOKE_UNSUPPORTED` for every op_arg;
+  after PFS-10 the kernel's `cap_handler_pdxfs_mount_table` has a
+  wired `pmt_hn_append` arm (requires `R_PMT_WRITE`; returns 0).
+  Without a tool-side `KIND_PDXFS_MOUNT_TABLE` cap seed (still
+  PFS-02 work) the kernel refuses with `INVOKE_*` and the discard
+  posture is unchanged.
+- Dry-run path (`--dry-run`) is byte-for-byte unchanged — the dry-run
+  gate still short-circuits before step 1 (build dev-path) so a
+  dry-run invocation issues no `sys_mount` syscall at all.
+- `MR_RESULT_UNIMPL_BACKEND` (code 11) is now unreachable in practice:
+  the kernel's `SYS_MOUNT_UNIMPL_PDXFS_BLOCK` (0xFFFFED63) is
+  explicitly marked RESERVED after R107.M1 landed the real backend=5
+  body (per `design/pdxfs/sys-mount-abi.md §2.7`). The result-code
+  label is retained for wire-format compatibility.
+
+### Known PFS gaps outside PFS-10's scope
+
+- **PFS-02 cap-seeding** — no production `_init_caps` hook seeds
+  `mount.pdxfs` with a `KIND_PDXFS_MOUNT_TABLE` slot carrying
+  `R_PMT_WRITE`. `MOUNT_OP_PMT_CAP_SLOT_PLACEHOLDER = 3` is a
+  documented placeholder; the discard posture on the cap-invoke's
+  return makes this harmless at this landing.
+- **PFS-11 `VOL_OP_QUERY_DEVICE_SLOT`** — the `& 0xF` low-nibble
+  stop-gap in `mount_op_build_dev_path` is replaced by a real
+  `cap_invoke` resolving the volume cap to its device slot without
+  modulo-16 narrowing. Collisions on the low nibble today surface
+  cleanly as `SYS_MOUNT_ENODEV` (`0xFFFFED66`).
+
+### Encoder-pitfall discipline
+
+- No `add reg, [mem]` anywhere (every add operates on registers or
+  an immediate). No `test` mnemonic. No `imul` / `mul` — hex-digit
+  formatting uses `cmp rax, 10; jl … ; add rax, 0x57 | 0x30`,
+  avoiding any multiply. No multiline `pub let ="..."`.
+  Labels prefixed `mount_op_` / `mount_op_bdp_` / `mount_op_sl_`
+  (none collide with reserved `loop` / `if` / `let`).
+
+Closes `paideia-os#2577` (PFS-10). Depends on the paideia-os kernel at
+Wave 94: `src/kernel/core/cap/kind_pdxfs_mount_table.pdx`'s
+`PMT_OP_APPEND_ROW` dispatch arm.
+
 ## 1.1.4 — 2026-10-11 (PFS-07 / paideia-os#2574: adapt snapshot_wire_list to libpdx-volume v1.1.7's 3-arg snap_chain_walk)
 
 **Patch bump — observable behaviour UNCHANGED (`--snapshot-list`
