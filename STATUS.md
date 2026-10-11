@@ -73,37 +73,39 @@ full 15-issue breakdown this checklist mirrors.
       repo's `tools/build.sh` (single-file compiles, no link step) nor
       any other script performs the actual cross-repo link yet.
 - [x] **M2-002** — real `sys_mount` invocation + mount-table row append
-      via `KIND_PDXFS_MOUNT_TABLE`: landed as a documented STUB, not a
-      working call, per this issue's own instruction. New
-      `src/mount_op.pdx`. **Three kernel-side gaps found and cited by
-      source location** (see that file's own header for the full
-      write-up): (1) `sysno 75` (`sys_mount`)'s live dispatch label
-      (`dispatch_mount`, `src/kernel/core/syscall/dispatch.pdx` L1975)
-      is STILL an unconditional `-ENOSYS` stub that reads no argument
-      register, despite `sys_mount_body`/`sys_mount_shim`
-      (`sys_mount.pdx`) already having a complete, real, audit-emitting
-      implementation — the dispatch-table wiring between the two was
-      simply never landed; (2) even once wired, `sys_mount_body`'s real
-      signature (`dev_path_ptr, dev_path_len, mount_point_ptr,
-      mount_point_len, backend_id`) does not accept a `KIND_VOLUME` cap
-      slot at all, contradicting `dispatch.pdx`'s own forward-
-      declaration comment (L1951-1962) documenting a cap-slot-based
-      ABI for the same sysno — two incompatible target ABIs for one
-      syscall number; (3) `KIND_PDXFS_MOUNT_TABLE`'s cap-invoke handler
-      (`kind_pdxfs_mount_table.pdx`) refuses every op including the
-      reserved `PMT_OP_APPEND_ROW` (2) with `INVOKE_UNSUPPORTED` — no
-      row-append op is wired, and no `_init_caps`-style convention
-      seeds a standalone CLI tool with a mount-table cap slot in the
-      first place. `mount_op_invoke` issues the syscall using the
-      aspirational cap-slot ABI (gap #2's shape) and treats any
-      implausible return (anything ≥ 65536) as `MOUNT_OP_ERR_KERNEL` —
-      today that is EVERY non-dry-run invocation, given gap #1.
-      `mount_op_append_row`'s `cap_invoke` result is discarded
-      (best-effort, matching `audit_emit`'s own discard convention).
-      **Confirm with osarch which of the two ABIs (gap #2) sysno 75
-      should actually grow into before wiring `dispatch_mount` for
-      real** — this is the concrete evidence for the "confirm before
-      M2-001" flag this repo's own M1 landing already raised.
+      via `KIND_PDXFS_MOUNT_TABLE`: landed as a stub-shaped first draft
+      against the ABI understood at that landing. **KERNEL ABI frozen at
+      paideia-os commit `c49a4bff` per
+      [`design/pdxfs/sys-mount-abi.md`](https://github.com/paideia-os/paideia-os/blob/main/design/pdxfs/sys-mount-abi.md)
+      (PFS-01, 2026-10-11).**  The three "KERNEL GAP" bullets this
+      landing originally cited are RETRACTED — direct source reads
+      performed under PFS-01 confirm:
+      - `dispatch_mount` (`src/kernel/core/syscall/dispatch.pdx`
+        L2452-L2461) is a real, wired shim as of R53.M2 that register-
+        shuffles and tail-calls `sys_mount_shim`.  It is NOT an
+        `-ENOSYS` stub.
+      - The dispatch comment at L2400-L2422 describing a cap-slot ABI
+        is explicitly retracted on-site (L2429-L2431 says the comment
+        "described a design that never landed; the shim's actual
+        signature is what ships").  The sole live ABI is the dev-path-
+        string shape of `sys_mount_body`.
+      - `KIND_PDXFS_MOUNT_TABLE`'s dispatch (`kind_pdxfs_mount_table.pdx`
+        L755-L822) wires `PMT_OP_QUERY_SLOT_COUNT` (3) and
+        `PMT_OP_REMOVE_ROW` (4); `PMT_OP_APPEND_ROW` (2) remains
+        reserved-but-unwired — PFS-02 lands the `_init_caps` seed
+        convention and this repo's PFS-10 wires the real
+        `mount_op_invoke` body against the frozen ABI.
+      **PFS-10 unblocks real end-to-end mount** (rewrites
+      `src/mount_op.pdx` against the frozen dev-path-string ABI;
+      derives `dev_path`/`mount_point` strings from the `<volume-cap>`
+      positional + `<mount-point>` arg).  **PFS-11 closes the
+      KIND_BLOCK_DEVICE resolver gap** flagged below (`dev_cap = 0`
+      placeholder in `mint_wire.pdx`; wires
+      `VOL_OP_QUERY_DEVICE_SLOT` for real).  **PFS-12 wires
+      `--passphrase-fd` to the frozen mount hop** (consumes PFS-05's
+      `pdxb_block_encrypt`/`decrypt` real bodies).  The current
+      `src/mount_op.pdx` text describing an aspirational cap-slot ABI
+      stays in place until PFS-10's rewrite replaces it.
 - [x] **M2-003** — user-subtree mount path (no elevate; `/home/$user` +
       `/mnt` + `/tmp`): landed. `src/elevate.pdx`'s M1 stub replaced
       with a real three-bucket classifier
@@ -134,14 +136,14 @@ unmodified, as a still-valid M1 call shape). A shared
 digit-conversion loop so both `flags` and the new `mount_id` field
 reuse one implementation.
 
-Given the M2-002 kernel gaps above, `mount.pdxfs`'s real (non-`--dry-
-run`) mount path is not reachable end-to-end today: `--dry-run` still
-works exactly as M1 left it (result_code: DRY_RUN, exit 0); any
-non-dry-run invocation with a valid argv, a never-elevate mount point,
-and a well-formed `<volume-cap>` URI reaches `mount_op_invoke`'s real
-branch, issues the (currently `-ENOSYS`) syscall, and reports
-`result_code: KERNEL_ERROR` with exit 3 — this is the correct,
-documented M2 landing behaviour, not a defect in this repo.
+**UPDATED 2026-10-11 (PFS-01):** the "KERNEL GAP" posture this
+paragraph documented is retracted — `dispatch_mount` is wired and
+`sys_mount_body` is complete.  Today's `mount_op_invoke` still
+issues the aspirational cap-slot ABI, so every non-dry-run invocation
+still misses the real sys_mount shape and reports
+`result_code: KERNEL_ERROR` for a different reason (shape mismatch,
+not `-ENOSYS`).  PFS-10 lands the rewrite that produces the real
+end-to-end mount; `--dry-run` continues to work exactly as M1 left it.
 
 ### M3 — Elevate + audit-first + semantic-pipe — **landed**
 
@@ -192,12 +194,15 @@ documented M2 landing behaviour, not a defect in this repo.
       record_classify_mount_errno`. `src/mount_op.pdx`'s `mount_op_
       invoke` grows a 5th out-param (`out_raw_errno_ptr`, staged into a
       newly-pushed callee-save `r15` to survive the real-path syscall's
-      caller-save-zeroing hardening) to feed it. Given `dispatch_mount`
-      is still an unconditional `-ENOSYS` stub (`src/mount_op.pdx`'s own
-      KERNEL GAP #1, unchanged since M2), `MR_RESULT_ENOSYS` (14) is the
-      one real, observed outcome today for any non-dry-run invocation;
-      the other six `SYS_MOUNT_*` arms are real, wired, unreachable
-      until `dispatch_mount` is wired for real.
+      caller-save-zeroing hardening) to feed it. **PFS-01 retraction
+      (2026-10-11):** `dispatch_mount` is wired (not an `-ENOSYS` stub);
+      `MR_RESULT_ENOSYS` (14) is NOT today's observed outcome.
+      Today's non-dry-run outcome is `MR_RESULT_KERNEL_ERROR` classified
+      from the ABI-mismatch sentinel sys_mount returns to the
+      aspirational cap-slot call shape `mount_op_invoke` still issues;
+      PFS-10 rewrites the call site against the frozen path-based ABI
+      (per `design/pdxfs/sys-mount-abi.md` §2) and the six `SYS_MOUNT_*`
+      sentinel arms become naturally reachable.
 
 `src/main.pdx`'s `_start` is rewritten to wire all six modules together:
 `r13` (dead `argv` after `argv_parse`) is reused to hold the shared
@@ -231,8 +236,10 @@ small, distinct emit-commit-exit block per failure cause.
       DISTINCT `MR_RESULT_*` codes: a malformed volume-cap hex tail
       (`BAD_VOLUME_CAP`), an unrecognised mount-point prefix (`INVALID_
       MOUNT_POINT`), a `/system/**` path (`ELEVATION_STUB`), and a
-      well-formed real-mount attempt against the still-unwired kernel
-      (`ENOSYS`).
+      well-formed real-mount attempt (originally `ENOSYS` — per PFS-01
+      retraction, today's actual outcome is `KERNEL_ERROR` from the
+      ABI shape mismatch; PFS-10 updates this test to the frozen ABI
+      and expects `MOUNT_OP_OK` on a legal invocation).
 - [x] **M4-004** — elevate-timeout path: landed as a documented STUB per
       this issue's own instruction. `tests/test_elevate_timeout.pdx`
       always returns a `TET_DEFERRED` sentinel (deliberately distinct
@@ -323,11 +330,12 @@ small, distinct emit-commit-exit block per failure cause.
       `--passphrase-fd=<n>` into `ParsedArgv.passphrase_fd` (offset
       +32, i64, -1 sentinel unset). Mount-time hook that calls the
       wire is a Phase-5 addition deferred behind GAP #P2 (no
-      `KIND_DEK` cap kernel-side) and the pre-existing M2 gap
-      (`dispatch_mount` unwired). The dispatched path today
-      silently ignores `--passphrase-fd` at the mount hop; a
-      follow-up landing wires it once both gaps close. Parents:
-      `libpdx-volume` #29/#30.
+      `KIND_DEK` cap kernel-side) and the M2 shape-mismatch bug (NOT
+      a dispatch_mount gap — see PFS-01 retraction above; the real
+      blocker is `src/mount_op.pdx`'s aspirational cap-slot call
+      shape, closed by PFS-10). The dispatched path today silently
+      ignores `--passphrase-fd` at the mount hop; **PFS-12** wires it
+      once PFS-10 lands. Parents: `libpdx-volume` #29/#30.
 - [x] **M6-005 (#24 B)** — LV.M4 quota enforcement wrapper:
       landed. New `src/quota_wire.pdx`. `quota_wire_sb_has_quota`
       + `quota_wire_install` (documented no-op stub per GAP #Q1:
@@ -351,8 +359,9 @@ argv parse, checking `PA_FLAG_ALL` → `PA_FLAG_SNAPSHOT_LIST` →
 `PA_FLAG_SNAPSHOT_SET` in fixed precedence order and jumping to the
 matching M6 handler. `--passphrase-fd` deliberately has no M6 branch;
 it falls through to the legacy pipeline (its mount-time consumption
-is a future Phase-5 wiring, gated on GAPs #P2 and the M2
-`dispatch_mount` unwired-stub).
+is a future Phase-5 wiring, gated on GAP #P2 and the M2 call-shape
+bug fixed by PFS-10; the earlier citation of "dispatch_mount unwired"
+is retracted per PFS-01).
 
 `src/mount_record.pdx` grew six new `MR_RESULT_*` codes (16..21) at
 v1.1.0 and their matching label literals, wired into `mount_record_
@@ -370,31 +379,33 @@ requires only `<volume-cap>`; `--snapshot=` requires only
 
 ## Next milestone
 
-None currently scoped past M6. `mount.pdxfs` v1.1.0's real, end-to-end
-mount path remains blocked on the three kernel-side gaps `src/mount_op.
-pdx` and `src/elevate.pdx` each document in full (`dispatch_mount`'s
-unwired stub, the two-incompatible-ABI question, `KIND_PDXFS_MOUNT_
-TABLE`'s unwired `APPEND_ROW`, and `libpdx-elevate`'s unprovisioned
-broker-endpoint cap) plus the six NEW M6 gaps (KERNEL GAPs #A/#B, and
-GAPs #P1/#P2/#Q1/#Q2 documented above and in each new wire module's
-own header) — none of which is this repo's own milestone to close.
-Three concrete asks carried forward from M2, unchanged:
+Addressed via the **PFS AISSUE wave** (paideia-os PFS-01..PFS-17, filed
+2026-10-11).  **KERNEL ABI frozen at paideia-os commit `c49a4bff` per
+`design/pdxfs/sys-mount-abi.md` (PFS-01)** — the aspirational cap-slot
+ABI the asks below were waiting on is retracted, and the live kernel
+has the dev-path-string shape that `sys_mount_body` already shipped.
+Ticket map for this repo's remaining work:
 
-1. Which ABI sysno 75 (`sys_mount`) should grow into: the cap-slot
-   contract `dispatch.pdx`'s own forward-declaration comment documents,
-   or `sys_mount_body`'s already-landed dev-path-string signature —
-   they are mutually incompatible today (`src/mount_op.pdx`'s header).
-2. Wire `dispatch_mount` (dispatch.pdx L1975) to whichever body results
-   from (1) — it is currently an unconditional `-ENOSYS` stub.
-3. Wire `KIND_PDXFS_MOUNT_TABLE`'s `PMT_OP_APPEND_ROW` (reserved
-   ordinal 2) for real, and establish an `_init_caps`-style convention
-   for seeding a standalone CLI tool (not just a long-running IPC
-   server) with a cap slot for that kind.
-4. Provision `mount.pdxfs` with a real `KIND_ELEVATE_CHANNEL`
-   broker-endpoint cap (the `parent_ep_slot` `libpdx-elevate`'s own
-   README says is the caller's responsibility) so `src/elevate.pdx`'s
-   `mount_elev_require_system` can grow a real `elevate_client_acquire`
-   body — carried forward from M3-001, new at this landing.
+1. **PFS-10 — ABI reconciliation.**  Rewrites `src/mount_op.pdx` to
+   the frozen path-based `sys_mount_shim` ABI (per
+   `design/pdxfs/sys-mount-abi.md` §2); derives `dev_path`/`mount_point`
+   strings from the `<volume-cap>` + `<mount-point>` positional args;
+   closes the ABI-mismatch bug this repo's M2 landing documented.
+2. **PFS-11 — KIND_BLOCK_DEVICE resolver.**  Maps `<volume-cap>` to the
+   backing dev_cap via `VOL_OP_QUERY_DEVICE_SLOT`; closes the
+   `dev_cap = 0` placeholder in `src/mint_wire.pdx`; real elevate
+   wire-through for `/system` paths (consumes PFS-02's
+   `_init_caps` seed + PFS-09's `vol_kind_mint` real body).
+3. **PFS-12 — `--passphrase-fd` call-site wiring.**  KEK derive → DEK
+   unwrap → mount hop; closes the Phase-5 deferral M6-004 flagged.
+   (Depends on PFS-05's `pdxb_block_encrypt` real body + PFS-10's
+   mount hop.)
+4. **PFS-02 (parent-repo scope) — `_init_caps` seed convention.**
+   Provisions standalone CLI tools (mount.pdxfs / umount.pdxfs) with
+   `KIND_PDXFS_MOUNT_TABLE` row-append/remove cap +
+   `KIND_ELEVATE_CHANNEL` broker-endpoint cap at exec time.  Closes
+   the "no broker-endpoint cap provisioned" blocker both M3-001 and
+   M6-002 cite.
 
 The `KIND_VOLUME` op-catalog gap flagged in `caps.decl` (no
 `VOL_OP_MOUNT` ordinal) and the missing `cap_check_kind` primitive
