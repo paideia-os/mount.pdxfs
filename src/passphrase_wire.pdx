@@ -1,6 +1,15 @@
 // src/passphrase_wire.pdx — mount.pdxfs.M6-004 (#24 part A) —
 // --passphrase-fd=<n> read + KEK derive + DEK unwrap composition.
 //
+// PFS-W10 (paideia-os #2731): rewired to CLOSE GAP #P2 by handing the
+// 32-byte unwrapped DEK to the new supervisor sys_dek_seal syscall
+// (SC+ ID 136), which seeds a kernel-held KIND_DEK row and returns a
+// row_id.  passphrase_wire_unlock gained a 4th argument (volume_cap_
+// slot) and stores the returned row_id in `passphrase_wire_dek_row_id`.
+// Both the 32-byte .bss DEK scratch AND the 4KiB-aligned syscall
+// staging page are wiped on every return path -- no plaintext DEK
+// survives in this address space past the syscall boundary.
+//
 // ----------------------------------------------------------------------
 // Wire shape
 // ----------------------------------------------------------------------
@@ -23,8 +32,12 @@
 //           (nonce accessor: see gap #P1 below).
 //        d. Derive the KEK via pdxb_kek_derive.
 //        e. Unwrap the DEK via pdxb_dek_unwrap.
-//        f. On success, install the DEK as a KIND_DEK cap slot
-//           kernel-side (see gap #P2 below).
+//        f. On success, copy the 32-byte DEK into the 4KiB-aligned
+//           syscall staging page, invoke sys_dek_seal(volume_cap_
+//           slot, &staging_page, 0) and record the returned row_id in
+//           `passphrase_wire_dek_row_id`; wipe BOTH the 32-byte
+//           scratch AND the staging page before return.  (PFS-W10
+//           closes the former GAP #P2.)
 //   4. If PDXB_FLAG_ENCRYPTED is not set and passphrase_fd != -1,
 //      silently ignore (matches mkfs.pdxfs's own "flag given but not
 //      applicable" precedent -- no error, no warning).
@@ -44,16 +57,14 @@
 //     v1.1.x follow-up**: add pdxb_sb_get/set_dek_nonce accessors so
 //     this module can drop the hardcoded offset.
 //
-//   GAP #P2: no KIND_DEK cap kernel-side. libpdx-volume's own
-//     `pdxb_dek_unwrap` takes a raw `out_dek_ptr` (32 bytes of
-//     plaintext DEK); to "install" that as a KIND_DEK cap and hand
-//     the slot to the kernel FS layer for per-block decrypt, a new
-//     cap kind + a mint syscall + a cap-invoke op catalog for the
-//     block-decrypt path all need to land in paideia-os. Until that
-//     wave lands, this module leaves the unwrapped DEK in a private
-//     .bss buffer (mount_pw_dek_scratch below) and returns PW_OK; a
-//     future landing wires the "install as cap" step at the bottom
-//     of `passphrase_wire_unlock`.
+//   GAP #P2 (CLOSED by PFS-W10 / paideia-os #2731): the KIND_DEK cap
+//     substrate landed in Wave 96 (PFS-12 / paideia-os #2579) and the
+//     supervisor sys_dek_seal mint hop landed in Wave PFS-W10 (sysno
+//     136, src/kernel/core/syscall/sys_dek_seal_body.pdx).  This
+//     module now completes the unlock pipeline by invoking the
+//     syscall at the bottom of `passphrase_wire_unlock` and scrubbing
+//     all plaintext-DEK state before returning.  See
+//     design/pdxfs/sys-dek-seal-abi.md for the syscall contract.
 //
 // ----------------------------------------------------------------------
 // Fail-closed on wrong passphrase
@@ -87,6 +98,18 @@ module PassphraseWire = structure {
   pub let PW_ERR_KDF_FAIL            : u64 = 4
   pub let PW_ERR_NO_PASSPHRASE_FD    : u64 = 5
 
+  // --- PFS-W10 (paideia-os #2731) seal-hop return codes. ---------------
+  //
+  // Band 0x0F10..0x0F1F is reserved for sys_dek_seal failure classes
+  // folded through this module.  Only one surface code is defined at
+  // the PFS-W10 landing (the kernel's three distinct failure classes
+  // -- INVALID_SLOT, INVALID_PAGE, MINT_FAILED -- collapse into one
+  // mount.pdxfs error class so main.pdx has a single MR_RESULT_SEAL_
+  // FAILED row to route; a future refinement that cares about the
+  // distinction would widen the band at 0x0F11+ without touching
+  // callers that already dispatch on 0x0F10).
+  pub let PW_ERR_SEAL_FAILED         : u64 = 0x0F10
+
   // --- Bounded scratch sizes. --------------------------------------------
   pub let PW_PASSPHRASE_MAX_LEN      : u64 = 256
   pub let PW_KEK_LEN                 : u64 = 32   // LPV_KEK_LEN
@@ -94,17 +117,56 @@ module PassphraseWire = structure {
   pub let PW_SALT_LEN                : u64 = 16   // LPV_KDF_SALT_LEN
   pub let PW_NONCE_LEN               : u64 = 12   // LPV_AEAD_NONCE_LEN
   pub let PW_WRAPPED_DEK_LEN         : u64 = 48   // LPV_WRAPPED_DEK_LEN
+  pub let PW_SEAL_PAGE_BYTES         : u64 = 4096 // sys_dek_seal pinned page
 
   // --- Superblock-side offset (GAP #P1). ---------------------------------
   pub let PW_D_OFF_DEK_NONCE         : u64 = 256
 
   // --- SC+ syscall IDs. --------------------------------------------------
   pub let PW_SC_READ                 : u64 = 0    // sys_read
+  pub let PW_SC_DEK_SEAL             : u64 = 136  // sys_dek_seal (PFS-13)
+
+  // --- sys_dek_seal packed-return decode constants. ---------------------
+  pub let PW_SDS_STATUS_MASK         : u64 = 3    // bits [1:0]
+  pub let PW_SDS_STATUS_BITS         : u64 = 2    // row_id << 2 shift
+
+  // --- Sentinel for "no DEK row sealed yet". ---------------------------
+  //
+  // kind_dek.pdx uses 0xFF (DEK_ROW_NONE) as the "row-id unset"
+  // sentinel; this module mirrors that convention so a caller can
+  // test `passphrase_wire_dek_row_id != PW_DEK_ROW_NONE` to decide
+  // whether a scrub/revoke hop is needed at umount.
+  pub let PW_DEK_ROW_NONE            : u64 = 0xFF
 
   // --- .bss ephemeral scratch. All wiped after use (see wipe helper). --
-  pub let mut mount_pw_passphrase_scratch : [u8; 256] = uninit @align(8)
-  pub let mut mount_pw_kek_scratch        : [u8; 32]  = uninit @align(8)
-  pub let mut mount_pw_dek_scratch        : [u8; 32]  = uninit @align(8)
+  pub let mut mount_pw_passphrase_scratch : [u8; 256]  = uninit @align(8)
+  pub let mut mount_pw_kek_scratch        : [u8; 32]   = uninit @align(8)
+  pub let mut mount_pw_dek_scratch        : [u8; 32]   = uninit @align(8)
+
+  // --- PFS-W10: 4KiB-aligned syscall staging page. ---------------------
+  //
+  // sys_dek_seal's pinned-page gate requires a 4KiB-aligned user VA
+  // (design/pdxfs/sys-dek-seal-abi.md §Pinned-page gate semantics).
+  // The 32-byte unwrapped DEK is copied into the first 32 bytes of
+  // this page immediately before the syscall and wiped from both
+  // mount_pw_dek_scratch AND this page on every return path from
+  // passphrase_wire_unlock -- plaintext DEK bytes never survive in
+  // mount.pdxfs's address space past the syscall return.  The 4064
+  // bytes above the DEK slot are left uninit at mint time and
+  // zeroed by the post-syscall wipe (which covers the full 4096
+  // bytes) so no uninit kernel-visible bytes leak either direction.
+  pub let mut mount_pw_dek_page_scratch   : [u8; 4096] = uninit @align(4096)
+
+  // --- PFS-W10: kernel-held KIND_DEK row_id after a successful seal. ---
+  //
+  // Set to the row_id returned by sys_dek_seal on the OK path; stays
+  // at PW_DEK_ROW_NONE across every failure path.  main.pdx consumes
+  // this at mount-table publish time (future landing) to associate
+  // the mounted volume with its DEK row for per-block crypto; umount
+  // reads it to compose a scrub cap-invoke (DEK_OP_SCRUB) on the
+  // KIND_VOLUME cap that resolves back to this same row via
+  // dek_lookup_body(volume_id = volume_row_of_slot(volume_cap_slot) + 1).
+  pub let mut passphrase_wire_dek_row_id  : u64 = 0xFF  // = PW_DEK_ROW_NONE
 
   // ==========================================================================
   // passphrase_wire_read(fd, out_len_ptr) -> u64
@@ -196,38 +258,55 @@ module PassphraseWire = structure {
     }
 
   // ==========================================================================
-  // passphrase_wire_unlock(sb_ptr, passphrase_ptr, passphrase_len) -> u64
+  // passphrase_wire_unlock(sb_ptr, passphrase_ptr, passphrase_len,
+  //                        volume_cap_slot) -> u64
   //     (PW_OK | PW_ERR_KDF_FAIL | PW_ERR_WRONG_PASSPHRASE |
-  //      PW_ERR_CRYPTO_FAIL)
+  //      PW_ERR_CRYPTO_FAIL | PW_ERR_SEAL_FAILED)
   //
-  //   rdi = sb_ptr          (decoded 4096-byte superblock buffer --
-  //                          caller must already have run
-  //                          pdxb_parse_superblock or read the raw block)
-  //   rsi = passphrase_ptr  (mount_pw_passphrase_scratch, from
-  //                          passphrase_wire_read)
-  //   rdx = passphrase_len  (out_len from passphrase_wire_read)
+  //   rdi = sb_ptr           (decoded 4096-byte superblock buffer --
+  //                           caller must already have run
+  //                           pdxb_parse_superblock or read the raw block)
+  //   rsi = passphrase_ptr   (mount_pw_passphrase_scratch, from
+  //                           passphrase_wire_read)
+  //   rdx = passphrase_len   (out_len from passphrase_wire_read)
+  //   rcx = volume_cap_slot  (PFS-W10: cap_table slot holding the live
+  //                           KIND_VOLUME cap with R_VOL_READ in its
+  //                           rights mask; this is the cap sys_dek_
+  //                           seal uses to tie the sealed row to the
+  //                           volume it belongs to -- see design/
+  //                           pdxfs/sys-dek-seal-abi.md §Contract)
   //
   // Step 1: pdxb_kek_derive(passphrase, len, salt=&sb[+240], salt_len=16,
   //          out=&mount_pw_kek_scratch)
   // Step 2: pdxb_dek_unwrap(kek=&mount_pw_kek_scratch,
   //          wrapped=&sb[+192], nonce=&sb[+256],
   //          out=&mount_pw_dek_scratch)
-  //
-  // Wipes the KEK scratch after step 2 (leaves the DEK scratch as the
-  // "installed" key material -- see GAP #P2 above). On any error,
-  // both scratches are wiped before returning.
+  // Step 3 (PFS-W10): copy mount_pw_dek_scratch -> first 32 bytes of
+  //          mount_pw_dek_page_scratch (4KiB-aligned); invoke
+  //          sys_dek_seal(volume_cap_slot, &mount_pw_dek_page_scratch,
+  //          flags=0); record the returned row_id in
+  //          passphrase_wire_dek_row_id on OK (status bits [1:0] == 0);
+  //          on failure jump to seal_fail funnel.
+  // Step 4 (PFS-W10): UNCONDITIONAL wipe of mount_pw_kek_scratch (32 B) +
+  //          mount_pw_dek_scratch (32 B) + mount_pw_dek_page_scratch
+  //          (4096 B).  Runs on every return path so no plaintext DEK
+  //          survives in this address space post-syscall.
   //
   // Bare-symbol cross-repo calls (`call pdxb_kek_derive`,
   // `call pdxb_dek_unwrap`) match src/volume_cap.pdx's own
   // libpdx-volume convention.
   // ==========================================================================
-  pub let passphrase_wire_unlock : (u64, u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto} =
-    fn (sb_ptr: u64) (passphrase_ptr: u64) (passphrase_len: u64) -> unsafe {
+  pub let passphrase_wire_unlock : (u64, u64, u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto} =
+    fn (sb_ptr: u64) (passphrase_ptr: u64) (passphrase_len: u64) (volume_cap_slot: u64) -> unsafe {
       effects: {crypto, mem, sysreg}, capabilities: {paideia.crypto},
-      justification: "mount.pdxfs.M6-004 (#24A): passphrase_wire_unlock entry point. push rbx (sb_ptr for the second call after the first call clobbers rdi). mov rbx,rdi. Step 1 -- KEK derive: rdi=passphrase_ptr (already there in rsi at entry, shuffle: mov rdi,rsi); rsi=passphrase_len (mov rsi,rdx); rdx=salt_ptr = sb_ptr+240 (PDXB_D_OFF_KDF_SALT); mov rdx,rbx; add rdx,240; rcx=salt_len=16; r8=out=&mount_pw_kek_scratch; lea r8,[rip+mount_pw_kek_scratch]; call pdxb_kek_derive. cmp rax,0; jne kdf_fail. Step 2 -- DEK unwrap: rdi=kek_ptr = &mount_pw_kek_scratch; lea rdi,[rip+mount_pw_kek_scratch]; rsi=wrapped_ptr = sb_ptr+192; mov rsi,rbx; add rsi,192; rdx=nonce_ptr = sb_ptr+256 (GAP #P1); mov rdx,rbx; add rdx,256; rcx=out=&mount_pw_dek_scratch; lea rcx,[rip+mount_pw_dek_scratch]; call pdxb_dek_unwrap. cmp rax,0; je unlock_ok; mov r10,0x0904 (LPV_CRYPTO_ERR_TAG_MISMATCH); cmp rax,r10; je wrong_pass; jmp crypto_fail. unlock_ok: wipe KEK (rdi=&kek_scratch, rsi=32; call passphrase_wire_wipe); pop rbx; xor rax,rax (PW_OK); ret. wrong_pass: wipe KEK; pop rbx; mov rax,2; ret. crypto_fail: wipe KEK+DEK; pop rbx; mov rax,3; ret. kdf_fail: pop rbx; mov rax,4; ret. `add reg,imm` used freely (not `add reg,[mem]`). No `test`. Labels prefixed mount_pw_ul_.",
+      justification: "mount.pdxfs.PFS-W10 (paideia-os #2731): passphrase_wire_unlock -- 4-arg entry (sb_ptr, passphrase_ptr, passphrase_len, volume_cap_slot). 3 callee-save pushes (rbx=sb_ptr, r12=passphrase_len fallback / r12-after-step-2=volume_cap_slot, r13 unused for 16-byte alignment) leave rsp%16==0 at every nested call from entry rsp%16==8. Step 1 KEK derive: rdi=passphrase_ptr (shuffle from rsi); rsi=passphrase_len (shuffle from rdx); rdx=sb_ptr+240 (PDXB_D_OFF_KDF_SALT salt_ptr); rcx=16 salt_len; r8=&mount_pw_kek_scratch; call pdxb_kek_derive -> jne kdf_fail. Step 2 DEK unwrap: rdi=&mount_pw_kek_scratch; rsi=sb_ptr+192 (wrapped_ptr); rdx=sb_ptr+256 (nonce_ptr -- GAP #P1); rcx=&mount_pw_dek_scratch; call pdxb_dek_unwrap. On rax==0 fall into Step 3; on rax==LPV_CRYPTO_ERR_TAG_MISMATCH (0x0904) go wrong_pass; else go crypto_fail. Step 3 seal hop: copy 32-byte DEK from mount_pw_dek_scratch into first 32 bytes of mount_pw_dek_page_scratch via four aligned u64 load/stores (loop would also work; four unrolled stores keep the function compact). Set up syscall ABI: rax=136 (PW_SC_DEK_SEAL), rdi=volume_cap_slot (from r12 saved pre-Step-1), rsi=&mount_pw_dek_page_scratch, rdx=0 (flags). Issue `syscall`. Decode packed return: rax = (row_id << 2) | status. mask status via `mov r11, 3; and r11, rax`; cmp r11, 0; jne seal_fail. On OK: `shr rax, 2` to extract row_id, store into passphrase_wire_dek_row_id. Jump to shared ok funnel. Step 4 unconditional wipes: ok / wrong_pass / crypto_fail / seal_fail all wipe KEK (32 B) + DEK (32 B) + DEK staging page (4096 B) via three passphrase_wire_wipe calls BEFORE return. kdf_fail runs before any DEK material was written so it wipes only the KEK (defensive). The scratch-wipe hoist is the whole point of PFS-W10's `no plaintext DEK survives` invariant. r12 holds volume_cap_slot across the KEK/DEK calls -- stashed at entry via `mov r12,rcx` before the Step 1 register shuffle clobbers rcx. `add reg,imm` used freely (not `add reg,[mem]`). No `test`. Labels prefixed mount_pw_ul_.",
       block: {
         push rbx;
+        push r12;
+        push r13;
+
         mov rbx, rdi;                        // rbx = sb_ptr
+        mov r12, rcx;                        // r12 = volume_cap_slot (survives Steps 1-2)
 
         // ---- Step 1: KEK derive. ---------------------------------------
         mov rdi, rsi;                        // passphrase_ptr
@@ -251,19 +330,67 @@ module PassphraseWire = structure {
         call pdxb_dek_unwrap;
 
         cmp rax, 0;
-        je mount_pw_ul_ok;
+        je  mount_pw_ul_seal;
 
         mov r10, 0x0904;                     // LPV_CRYPTO_ERR_TAG_MISMATCH
         cmp rax, r10;
-        je mount_pw_ul_wrong_pass;
+        je  mount_pw_ul_wrong_pass;
         jmp mount_pw_ul_crypto_fail;
 
+        // ---- Step 3 (PFS-W10): copy DEK to staging page + syscall. ----
+      mount_pw_ul_seal:
+        // Copy 32 bytes (four u64 words) from mount_pw_dek_scratch to
+        // mount_pw_dek_page_scratch's first 32 bytes.  Aligned u64
+        // load/stores because both buffers carry @align(8+)-friendly
+        // alignment (page is @align(4096), scratch is @align(8)).
+        lea r10, [rip + mount_pw_dek_scratch];
+        lea r11, [rip + mount_pw_dek_page_scratch];
+        mov rax, [r10 + 0];
+        mov [r11 + 0],  rax;
+        mov rax, [r10 + 8];
+        mov [r11 + 8],  rax;
+        mov rax, [r10 + 16];
+        mov [r11 + 16], rax;
+        mov rax, [r10 + 24];
+        mov [r11 + 24], rax;
+
+        // sys_dek_seal(volume_cap_slot, pinned_page_addr, flags=0)
+        //   rax = 136 (PW_SC_DEK_SEAL)
+        //   rdi = volume_cap_slot
+        //   rsi = &mount_pw_dek_page_scratch
+        //   rdx = 0 (flags)
+        mov rdi, r12;                        // volume_cap_slot
+        lea rsi, [rip + mount_pw_dek_page_scratch];
+        xor rdx, rdx;                        // flags
+        mov rax, 136;                        // PW_SC_DEK_SEAL
+        syscall;
+
+        // Decode packed return: rax = (row_id << 2) | status.
+        //   status = rax & PW_SDS_STATUS_MASK (3)
+        //   row_id = rax >> PW_SDS_STATUS_BITS (2) -- only valid on OK.
+        mov r11, 3;                          // PW_SDS_STATUS_MASK
+        and r11, rax;
+        cmp r11, 0;
+        jne mount_pw_ul_seal_fail;
+
+        shr rax, 2;                          // PW_SDS_STATUS_BITS
+        mov [rip + passphrase_wire_dek_row_id], rax;
+        jmp mount_pw_ul_ok;
+
+        // ---- Step 4: unconditional scrubs on every return path. --------
       mount_pw_ul_ok:
-        // Wipe KEK; DEK remains in scratch until installed (GAP #P2).
         lea rdi, [rip + mount_pw_kek_scratch];
         mov rsi, 32;
         call passphrase_wire_wipe;
+        lea rdi, [rip + mount_pw_dek_scratch];
+        mov rsi, 32;
+        call passphrase_wire_wipe;
+        lea rdi, [rip + mount_pw_dek_page_scratch];
+        mov rsi, 4096;
+        call passphrase_wire_wipe;
 
+        pop r13;
+        pop r12;
         pop rbx;
         xor rax, rax;                        // PW_OK
         ret;
@@ -272,7 +399,12 @@ module PassphraseWire = structure {
         lea rdi, [rip + mount_pw_kek_scratch];
         mov rsi, 32;
         call passphrase_wire_wipe;
+        lea rdi, [rip + mount_pw_dek_scratch];
+        mov rsi, 32;
+        call passphrase_wire_wipe;
 
+        pop r13;
+        pop r12;
         pop rbx;
         mov rax, 2;                          // PW_ERR_WRONG_PASSPHRASE
         ret;
@@ -285,11 +417,41 @@ module PassphraseWire = structure {
         mov rsi, 32;
         call passphrase_wire_wipe;
 
+        pop r13;
+        pop r12;
         pop rbx;
         mov rax, 3;                          // PW_ERR_CRYPTO_FAIL
         ret;
 
+      mount_pw_ul_seal_fail:
+        // Seal hop refused -- scrub both the plaintext scratch and the
+        // 4KiB staging page before returning so the DEK does not
+        // outlive the failed syscall boundary.  (The KEK is already
+        // dead at this point too; wipe for defense in depth.)
+        lea rdi, [rip + mount_pw_kek_scratch];
+        mov rsi, 32;
+        call passphrase_wire_wipe;
+        lea rdi, [rip + mount_pw_dek_scratch];
+        mov rsi, 32;
+        call passphrase_wire_wipe;
+        lea rdi, [rip + mount_pw_dek_page_scratch];
+        mov rsi, 4096;
+        call passphrase_wire_wipe;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 0x0F10;                     // PW_ERR_SEAL_FAILED
+        ret;
+
       mount_pw_ul_kdf_fail:
+        // KDF failed before any DEK bytes were written; wipe KEK only.
+        lea rdi, [rip + mount_pw_kek_scratch];
+        mov rsi, 32;
+        call passphrase_wire_wipe;
+
+        pop r13;
+        pop r12;
         pop rbx;
         mov rax, 4;                          // PW_ERR_KDF_FAIL
         ret;

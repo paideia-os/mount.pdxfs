@@ -1,5 +1,77 @@
 # mount.pdxfs — CHANGELOG
 
+## 1.1.7 — 2026-10-11 (PFS-13 / paideia-os#2731: `sys_dek_seal` seal-hop closes GAP #P2)
+
+**Patch bump — closes the plaintext-DEK-in-.bss gap on the
+`--passphrase-fd` path.**  PFS-12 (Wave 96) landed the kernel-side
+`KIND_DEK` substrate; PFS-13 (Wave PFS-W10) adds the supervisor
+`sys_dek_seal` syscall (SC+ ID 136).  This bump rewires
+`passphrase_wire_unlock` to hand the 32-byte unwrapped DEK to the new
+syscall, record the returned `row_id` in a dedicated `.bss` slot, and
+scrub every plaintext scratch before returning.
+
+### Added
+
+- **`PW_ERR_SEAL_FAILED = 0x0F10`** — new return code for
+  `passphrase_wire_unlock`.  Band `0x0F10..0x0F1F` is reserved for
+  `sys_dek_seal` failure classes; only one surface code is defined
+  at this landing (the kernel's three distinct failure classes
+  collapse into one mount.pdxfs error class so main.pdx has a
+  single `MR_RESULT_SEAL_FAILED` row to route).
+- **`mount_pw_dek_page_scratch : [u8; 4096] @align(4096)`** (NEW
+  `.bss` scratch) — 4KiB-aligned staging page the DEK is copied into
+  immediately before the `sys_dek_seal` syscall.  Both this page and
+  the 32-byte `mount_pw_dek_scratch` are wiped on every return path
+  from `passphrase_wire_unlock`.
+- **`passphrase_wire_dek_row_id : u64 = 0xFF`** (NEW `.bss` slot)
+  — records the returned `KIND_DEK` `row_id` on the OK path; stays
+  at `PW_DEK_ROW_NONE = 0xFF` across every failure path.  Consumed
+  by main.pdx at mount-table publish time (future landing) and by
+  the umount path (`DEK_OP_SCRUB` cap-invoke on the KIND_VOLUME cap
+  resolves back to this same row via `dek_lookup_body`).
+- **`PW_SC_DEK_SEAL = 136`** — SC+ sysno constant for the new
+  supervisor syscall.
+- **Constants `PW_SDS_STATUS_MASK = 3` / `PW_SDS_STATUS_BITS = 2`**
+  for decoding the packed return `(row_id << 2) | status`.
+
+### Changed
+
+- **`src/passphrase_wire.pdx::passphrase_wire_unlock`** signature
+  extended from 3 args to 4 args: a new `volume_cap_slot` argument
+  (the caller's cap-table slot holding the live KIND_VOLUME cap).
+  Flow becomes KDF-derive → DEK-unwrap → copy DEK to 4KiB-aligned
+  staging page → `sys_dek_seal` → store `row_id` → wipe scratches.
+  The 3-callee-save-push prologue (rbx=sb_ptr, r12=volume_cap_slot,
+  r13 for alignment) leaves `rsp%16==0` at every nested call.  Every
+  return path (OK / WRONG_PASS / CRYPTO_FAIL / SEAL_FAILED /
+  KDF_FAIL) runs the appropriate scrubs before `ret`.
+- **GAP #P2 CLOSED.**  The former _"this module leaves the
+  unwrapped DEK in a private .bss buffer"_ posture is retired; no
+  plaintext DEK bytes survive in the mount.pdxfs address space
+  past the `sys_dek_seal` syscall boundary.
+
+### Known gaps / future work
+
+- Main.pdx still does not call `passphrase_wire_unlock` on the
+  encrypted-mount path (per the existing main.pdx comment about
+  Phase-5 wiring); the user-side function is complete but the
+  caller-side route from `main.pdx::mount_main_m6_*` remains a
+  separate landing, blocked on the mount-table publish composition
+  wave.
+- `MR_RESULT_SEAL_FAILED` row needs to be added to `mount_record.pdx`
+  when the main.pdx wiring lands (new row immediately above the
+  existing `MR_RESULT_WRONG_PASSPHRASE`).
+
+### Design
+
+- Full ABI pinned at
+  `paideia-os:design/pdxfs/sys-dek-seal-abi.md` (NEW).
+
+### Upstream
+
+- Depends on paideia-os `sys_dek_seal_body.pdx` (SC+ ID 136), part
+  of paideia-os#2731 (PFS-13).
+
 ## 1.1.6 — 2026-10-11 (PFS-11 / paideia-os#2578: real `VOL_OP_QUERY_DEVICE_SLOT` wire-through + closes `dev_cap=0` for `/system` mounts)
 
 **Patch bump — correctness fix on a path only reachable once
